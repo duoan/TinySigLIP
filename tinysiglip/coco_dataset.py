@@ -77,15 +77,33 @@ class COCOCaptionIterableDataset(IterableDataset):
                 "Example: coco_root='path/to/coco/images', coco_ann_file='path/to/annotations/captions_train2017.json'"
             )
 
+        # Determine the correct image directory based on split
+        # COCO images are organized as: images/train2017/, images/val2017/, images/test2017/
+        # torchvision CocoCaptions expects root to point to the images directory,
+        # and annotation files contain paths like "train2017/xxxx.jpg"
+        # So we keep coco_root as the images directory (not the specific split directory)
         if not os.path.exists(coco_root):
             raise ValueError(f"COCO root directory does not exist: {coco_root}")
         if not os.path.exists(coco_ann_file):
             raise ValueError(f"COCO annotation file does not exist: {coco_ann_file}")
 
+        # Verify that the split directory exists
+        split_dir = os.path.join(coco_root, f"{split}2017")
+        if not os.path.exists(split_dir):
+            raise ValueError(
+                f"COCO split directory does not exist: {split_dir}\n"
+                f"Expected structure: {coco_root}/{{train2017,val2017,test2017}}/"
+            )
+
         # Load dataset using torchvision
+        # root should point to the images directory (not the specific split directory)
+        # because annotation files contain paths like "train2017/xxxx.jpg"
         print(f"Loading COCO Caption 2017 {split} split using torchvision...")
+        print(f"  Image root: {coco_root}")
+        print(f"  Annotation file: {coco_ann_file}")
+        print(f"  Split directory: {split_dir}")
         self.dataset = dset.CocoCaptions(
-            root=coco_root,
+            root=coco_root,  # Points to images/ directory, not images/train2017/
             annFile=coco_ann_file,
             transform=None,  # We'll handle transforms in _process_sample
         )
@@ -276,15 +294,33 @@ class COCOCaptionDataset(Dataset):
                 "Example: coco_root='path/to/coco/images', coco_ann_file='path/to/annotations/captions_train2017.json'"
             )
 
+        # Determine the correct image directory based on split
+        # COCO images are organized as: images/train2017/, images/val2017/, images/test2017/
+        # torchvision CocoCaptions expects root to point to the images directory,
+        # and annotation files contain paths like "train2017/xxxx.jpg"
+        # So we keep coco_root as the images directory (not the specific split directory)
         if not os.path.exists(coco_root):
             raise ValueError(f"COCO root directory does not exist: {coco_root}")
         if not os.path.exists(coco_ann_file):
             raise ValueError(f"COCO annotation file does not exist: {coco_ann_file}")
 
+        # Verify that the split directory exists
+        split_dir = os.path.join(coco_root, f"{split}2017")
+        if not os.path.exists(split_dir):
+            raise ValueError(
+                f"COCO split directory does not exist: {split_dir}\n"
+                f"Expected structure: {coco_root}/{{train2017,val2017,test2017}}/"
+            )
+
         # Load dataset using torchvision
+        # root should point to the images directory (not the specific split directory)
+        # because annotation files contain paths like "train2017/xxxx.jpg"
         print(f"Loading COCO Caption 2017 {split} split using torchvision...")
+        print(f"  Image root: {coco_root}")
+        print(f"  Annotation file: {coco_ann_file}")
+        print(f"  Split directory: {split_dir}")
         self.coco_dataset = dset.CocoCaptions(
-            root=coco_root,
+            root=coco_root,  # Points to images/ directory, not images/train2017/
             annFile=coco_ann_file,
             transform=None,  # We'll handle transforms in _process_sample
         )
