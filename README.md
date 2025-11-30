@@ -55,11 +55,44 @@ pip install -r requirements.txt
 
 **1. Training**
 
-Start training with default configuration:
+Start training with the universal training script:
+
+```bash
+./train.sh
+```
+
+The script automatically detects your hardware and training setup:
+- **Multiple GPUs**: Automatically uses distributed training (DDP) with all available GPUs
+- **Single GPU**: Runs single GPU training
+- **CPU/MacBook**: Falls back to CPU training
+
+You can also run directly:
 
 ```bash
 python train.py
 ```
+
+**Manual Multi-GPU Training:**
+
+If you want to manually specify the number of GPUs:
+
+```bash
+# Use torchrun directly
+torchrun --nproc_per_node=4 train.py
+
+# Or specify via environment variable
+NUM_GPUS=4 ./train.sh
+```
+
+**How it works:**
+
+The training script automatically detects the distributed training environment and will:
+- Initialize distributed training using NCCL backend (when multiple GPUs detected)
+- Wrap the model with DistributedDataParallel (DDP) for multi-GPU training
+- Use DistributedSampler for data distribution across GPUs
+- Only save checkpoints and logs on the main process (rank 0)
+
+**Note**: The batch size in `config/config.yaml` is the batch size per GPU. The effective batch size will be `batch_size × num_gpus` when using multiple GPUs.
 
 The training script uses Hydra for configuration management. Modify `config/config.yaml` to adjust hyperparameters.
 

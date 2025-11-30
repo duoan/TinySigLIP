@@ -3,14 +3,18 @@ Simplified training script for SigLIP distillation with Hydra configuration.
 """
 
 import math
+import os
 from pathlib import Path
 from typing import Any, cast
 
 import hydra
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from transformers import (
     AutoModel,
@@ -40,8 +44,44 @@ from tinysiglip.metrics import compute_evaluation_metrics
 from tinysiglip.model import TinySiglipModel
 from tinysiglip.processor import TinySiglipProcessor
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+
+def setup_distributed():
+    """Initialize distributed training environment."""
+    # Check if running in distributed mode
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+
+        # Initialize process group
+        dist.init_process_group(backend="nccl")
+
+        # Set device for this process
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+
+        return True, rank, world_size, local_rank, device
+    else:
+        # Single GPU or CPU mode
+        if torch.cuda.is_available():
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            # macOS Metal Performance Shaders (Apple Silicon)
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+        return False, 0, 1, 0, device
+
+
+def cleanup_distributed():
+    """Clean up distributed training environment."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(rank: int) -> bool:
+    """Check if current process is the main process (rank 0)."""
+    return rank == 0
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -59,8 +99,16 @@ def format_number(num: int) -> str:
         return str(num)
 
 
-def get_teacher_model(model_name="google/siglip2-base-patch16-224") -> SiglipModel:
+def get_teacher_model(model_name="google/siglip2-base-patch16-224", device=None) -> SiglipModel:
     """Load teacher SigLIP model."""
+    if device is None:
+        if torch.cuda.is_available():
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            # macOS Metal Performance Shaders (Apple Silicon)
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
     try:
         from transformers import SiglipModel
 
@@ -80,6 +128,15 @@ def main(cfg: DictConfig) -> None:
     Args:
         cfg: Hydra configuration object
     """
+    # Initialize distributed training
+    use_distributed, rank, world_size, local_rank, device = setup_distributed()
+
+    if use_distributed:
+        if is_main_process(rank):
+            print(f"Initialized distributed training: world_size={world_size}, rank={rank}, local_rank={local_rank}")
+    else:
+        print(f"Using device: {device}")
+
     # Extract configuration values
     TEACHER_MODEL_NAME = cfg.teacher.model_name
     BATCH_SIZE = cfg.training.batch_size
@@ -111,8 +168,8 @@ def main(cfg: DictConfig) -> None:
     log_every_n_steps = cfg.logging.log_every_n_steps
     eval_every_n_steps = cfg.logging.get("eval_every_n_steps", log_every_n_steps)
 
-    # Initialize WandB
-    wandb_enabled = cfg.wandb.get("enabled", False) and WANDB_AVAILABLE
+    # Initialize WandB (only on main process)
+    wandb_enabled = cfg.wandb.get("enabled", False) and WANDB_AVAILABLE and is_main_process(rank)
     if wandb_enabled:
         wandb_config = cfg.wandb
         run_name = wandb_config.get("name") or f"tinysiglip_{output_dir.name}"
@@ -129,27 +186,34 @@ def main(cfg: DictConfig) -> None:
     elif cfg.wandb.get("enabled", False) and not WANDB_AVAILABLE:
         print("Warning: WandB is enabled in config but not installed. Install with: pip install wandb")
 
-    # Print configuration
-    print("=" * 70)
-    print("Configuration:")
-    print(OmegaConf.to_yaml(cfg))
-    print("=" * 70)
-    print(f"Output directory: {output_dir}")
-    print(f"Checkpoint will be saved to: {checkpoint_path}")
-    print("=" * 70 + "\n")
+    # Print configuration (only on main process)
+    if is_main_process(rank):
+        print("=" * 70)
+        print("Configuration:")
+        print(OmegaConf.to_yaml(cfg))
+        print("=" * 70)
+        print(f"Output directory: {output_dir}")
+        print(f"Checkpoint will be saved to: {checkpoint_path}")
+        if use_distributed:
+            print(f"Distributed training: {world_size} GPUs")
+        print("=" * 70 + "\n")
 
     # Load teacher model and processor
-    print("Loading teacher model...")
-    teacher_model = get_teacher_model(TEACHER_MODEL_NAME)
+    if is_main_process(rank):
+        print("Loading teacher model...")
+    teacher_model = get_teacher_model(TEACHER_MODEL_NAME, device=device)
     teacher_config = teacher_model.config
 
     # Load teacher processor (recommended for proper preprocessing)
-    print("Loading teacher processor...")
+    if is_main_process(rank):
+        print("Loading teacher processor...")
     try:
         teacher_processor = AutoProcessor.from_pretrained(TEACHER_MODEL_NAME)
-        print("✓ Teacher processor loaded")
+        if is_main_process(rank):
+            print("✓ Teacher processor loaded")
     except Exception as e:
-        print(f"Warning: Could not load teacher processor: {e}")
+        if is_main_process(rank):
+            print(f"Warning: Could not load teacher processor: {e}")
         teacher_processor = None
 
     # Load tokenizers and create student processor for real data
@@ -157,7 +221,8 @@ def main(cfg: DictConfig) -> None:
     teacher_tokenizer = None
     student_processor = None
     if USE_REAL_DATA:
-        print("Loading tokenizers for real data...")
+        if is_main_process(rank):
+            print("Loading tokenizers for real data...")
 
         # Load teacher tokenizer (from processor or separately)
         if teacher_processor is not None:
@@ -268,18 +333,21 @@ def main(cfg: DictConfig) -> None:
             if isinstance(embed_layer, nn.Module) and hasattr(embed_layer, "num_embeddings"):
                 teacher_vocab_size = cast(int, embed_layer.num_embeddings)
 
-    print(f"Teacher projection dim: {teacher_projection_dim}")
-    print(f"Teacher vision dim: {teacher_vision_dim}")
-    print(f"Teacher text dim: {teacher_text_dim}")
-    print(f"Teacher vocab size: {teacher_vocab_size}")
+    if is_main_process(rank):
+        print(f"Teacher projection dim: {teacher_projection_dim}")
+        print(f"Teacher vision dim: {teacher_vision_dim}")
+        print(f"Teacher text dim: {teacher_text_dim}")
+        print(f"Teacher vocab size: {teacher_vocab_size}")
 
     # Determine student vocab size (use configured value or teacher's vocab size)
     if STUDENT_VOCAB_SIZE is None:
         STUDENT_VOCAB_SIZE = cast(int, teacher_vocab_size)
-        print(f"\nStudent vocab size: {STUDENT_VOCAB_SIZE} (same as teacher)")
+        if is_main_process(rank):
+            print(f"\nStudent vocab size: {STUDENT_VOCAB_SIZE} (same as teacher)")
     else:
-        print(f"\nStudent vocab size: {STUDENT_VOCAB_SIZE} (English-only)")
-        print("Note: In real training, use tokenizers to map text to token IDs for each model")
+        if is_main_process(rank):
+            print(f"\nStudent vocab size: {STUDENT_VOCAB_SIZE} (English-only)")
+            print("Note: In real training, use tokenizers to map text to token IDs for each model")
 
     # Calculate valid token ID range (for dummy data only)
     # Use the smaller of the two vocab sizes for token generation
@@ -288,7 +356,8 @@ def main(cfg: DictConfig) -> None:
     max_valid_token_id_teacher = max(1, cast(int, teacher_vocab_size) - 10)
 
     # Create student model
-    print("Creating student model...")
+    if is_main_process(rank):
+        print("Creating student model...")
     student_model = TinySiglipModel(
         vision_model_name=cfg.student.vision_model_name,
         vision_dim=cfg.student.vision_dim,
@@ -309,8 +378,9 @@ def main(cfg: DictConfig) -> None:
         student_vision_dim = student_vision_raw.shape[-1]
         student_text_dim = student_text_raw.shape[-1]
 
-    print(f"Student vision raw dim: {student_vision_dim}")
-    print(f"Student text raw dim: {student_text_dim}")
+    if is_main_process(rank):
+        print(f"Student vision raw dim: {student_vision_dim}")
+        print(f"Student text raw dim: {student_text_dim}")
 
     # Count parameters
     vision_backbone_params = count_parameters(student_model.vision_backbone)
@@ -326,23 +396,32 @@ def main(cfg: DictConfig) -> None:
 
     total_params = count_parameters(student_model)
 
-    print("\n=== Model Parameters ===")
-    print("Vision model parameters:")
-    print(f"  - Backbone: {vision_backbone_params:,} ({format_number(vision_backbone_params)})")
-    print(f"  - Projection: {vision_proj_params:,} ({format_number(vision_proj_params)})")
-    print(f"  - Total: {vision_params:,} ({format_number(vision_params)})")
-    print("\nText model parameters:")
-    print(f"  - Embedding: {text_embedding_params:,} ({format_number(text_embedding_params)})")
-    print(f"  - Position embedding: {text_pos_params:,} ({format_number(text_pos_params)})")
-    print(f"  - Transformer: {text_transformer_params:,} ({format_number(text_transformer_params)})")
-    print(f"  - Projection: {text_proj_params:,} ({format_number(text_proj_params)})")
-    print(f"  - Total: {text_params:,} ({format_number(text_params)})")
-    print(f"\nTotal student model parameters: {total_params:,} ({format_number(total_params)})")
-    print("========================\n")
+    if is_main_process(rank):
+        print("\n=== Model Parameters ===")
+        print("Vision model parameters:")
+        print(f"  - Backbone: {vision_backbone_params:,} ({format_number(vision_backbone_params)})")
+        print(f"  - Projection: {vision_proj_params:,} ({format_number(vision_proj_params)})")
+        print(f"  - Total: {vision_params:,} ({format_number(vision_params)})")
+        print("\nText model parameters:")
+        print(f"  - Embedding: {text_embedding_params:,} ({format_number(text_embedding_params)})")
+        print(f"  - Position embedding: {text_pos_params:,} ({format_number(text_pos_params)})")
+        print(f"  - Transformer: {text_transformer_params:,} ({format_number(text_transformer_params)})")
+        print(f"  - Projection: {text_proj_params:,} ({format_number(text_proj_params)})")
+        print(f"  - Total: {text_params:,} ({format_number(text_params)})")
+        print(f"\nTotal student model parameters: {total_params:,} ({format_number(total_params)})")
+        print("========================\n")
 
-    # Get embedding layers
+    # Get embedding layers (before DDP wrapping)
     student_embedding_layer = student_model.text_embedding
     student_embedding_dim = student_embedding_layer.embedding_dim
+
+    # Wrap model with DDP if using distributed training
+    if use_distributed:
+        student_model = DDP(
+            student_model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False
+        )
+        if is_main_process(rank):
+            print("✓ Student model wrapped with DistributedDataParallel")
 
     # Get teacher embedding layer
     teacher_embedding_layer: nn.Embedding | None = None
@@ -354,48 +433,56 @@ def main(cfg: DictConfig) -> None:
             teacher_embedding_layer = cast(nn.Embedding, embeddings.word_embeddings)
 
     if teacher_embedding_layer is None:
-        print("Warning: Could not find teacher embedding layer")
+        if is_main_process(rank):
+            print("Warning: Could not find teacher embedding layer")
 
     # Weight Transfer: One-time initialization of student embeddings from teacher
     if USE_WEIGHT_TRANSFER and teacher_embedding_layer is not None:
-        print("\n=== Performing Embedding Weight Transfer ===")
+        if is_main_process(rank):
+            print("\n=== Performing Embedding Weight Transfer ===")
         if hasattr(teacher_embedding_layer, "embedding_dim"):
             teacher_embedding_dim = cast(int, teacher_embedding_layer.embedding_dim)
         else:
             teacher_embedding_dim = student_embedding_dim
-        print(f"Student embedding dim: {student_embedding_dim}, Teacher embedding dim: {teacher_embedding_dim}")
+        if is_main_process(rank):
+            print(f"Student embedding dim: {student_embedding_dim}, Teacher embedding dim: {teacher_embedding_dim}")
 
         # Create token mapping - use real tokenizers if available, otherwise use dummy
-        print("Creating token mapping...")
+        if is_main_process(rank):
+            print("Creating token mapping...")
         if USE_REAL_DATA and student_tokenizer is not None and teacher_tokenizer is not None:
             # Use real tokenizers to find shared tokens
-            print("Using real tokenizers to find shared tokens...")
+            if is_main_process(rank):
+                print("Using real tokenizers to find shared tokens...")
             shared_student_indices, shared_teacher_indices = create_token_mapping(
                 teacher_tokenizer=teacher_tokenizer,
                 student_tokenizer=student_tokenizer,
-                verbose=True,
+                verbose=is_main_process(rank),
             )
         else:
             # Fallback to dummy mapping
-            print("Using dummy token mapping (no tokenizers available or using dummy data)...")
+            if is_main_process(rank):
+                print("Using dummy token mapping (no tokenizers available or using dummy data)...")
             shared_student_indices, shared_teacher_indices = create_dummy_token_mapping(
                 student_vocab_size=STUDENT_VOCAB_SIZE,
                 teacher_vocab_size=cast(int, teacher_vocab_size),
                 overlap_ratio=cfg.embedding.overlap_ratio,
             )
-        print(f"Shared tokens: {len(shared_student_indices)} (student) <-> {len(shared_teacher_indices)} (teacher)")
+        if is_main_process(rank):
+            print(f"Shared tokens: {len(shared_student_indices)} (student) <-> {len(shared_teacher_indices)} (teacher)")
 
-        # Transfer weights
+        # Transfer weights (use the embedding layer we already extracted before DDP wrapping)
         transferred_count = transfer_embedding_weights(
             student_embedding_layer=student_embedding_layer,
             teacher_embedding_layer=teacher_embedding_layer,
             shared_student_indices=shared_student_indices,
             shared_teacher_indices=shared_teacher_indices,
-            verbose=True,
+            verbose=is_main_process(rank),
         )
-        print(f"Successfully transferred {transferred_count} embedding weights!")
-        print("No embedding mimicking loss needed - weights already initialized.")
-        print("=============================================\n")
+        if is_main_process(rank):
+            print(f"Successfully transferred {transferred_count} embedding weights!")
+            print("No embedding mimicking loss needed - weights already initialized.")
+            print("=============================================\n")
 
     # Create distillation projections (map student raw features to teacher raw features)
     projection_v = nn.Linear(cast(int, student_vision_dim), cast(int, teacher_vision_dim)).to(device)
@@ -415,21 +502,24 @@ def main(cfg: DictConfig) -> None:
             num_warmup_steps=WARMUP_STEPS,  # Warmup steps
             num_training_steps=MAX_STEPS,  # Total training steps
         )
-        print("✓ Cosine learning rate scheduler with warmup initialized (HuggingFace style)")
-        print(f"  Initial LR: {LEARNING_RATE}")
-        print(f"  Warmup steps: {WARMUP_STEPS}")
-        print(f"  Total steps: {MAX_STEPS}")
-        print("  Final LR will decay to: ~0 (cosine decay)")
+        if is_main_process(rank):
+            print("✓ Cosine learning rate scheduler with warmup initialized (HuggingFace style)")
+            print(f"  Initial LR: {LEARNING_RATE}")
+            print(f"  Warmup steps: {WARMUP_STEPS}")
+            print(f"  Total steps: {MAX_STEPS}")
+            print("  Final LR will decay to: ~0 (cosine decay)")
     else:
         scheduler = None
 
     # Dataset and dataloader
     if USE_REAL_DATA:
-        print("\n=== Setting up COCO Dataset ===")
+        if is_main_process(rank):
+            print("\n=== Setting up COCO Dataset ===")
         if student_processor is None:
             raise ValueError("Student processor is required for real data")
         if teacher_processor is None:
-            print("Warning: Teacher processor not available. Using fallback preprocessing.")
+            if is_main_process(rank):
+                print("Warning: Teacher processor not available. Using fallback preprocessing.")
 
         # Update student processor augmentation based on split
         use_augmentation_for_split = USE_AUGMENTATION and DATASET_SPLIT == "train"
@@ -449,19 +539,31 @@ def main(cfg: DictConfig) -> None:
         )
         # For IterableDataset, shuffle is handled differently (use buffer_size)
         # num_workers=0 for IterableDataset to avoid issues with streaming
+        # Use DistributedSampler if using distributed training
+        sampler = None
+        if use_distributed:
+            # For IterableDataset, we can't use DistributedSampler directly
+            # Instead, we'll handle sharding in the dataset or use a workaround
+            # For now, we'll skip the sampler for IterableDataset
+            if not cfg.dataset.streaming:
+                sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False)
+
         dataloader = DataLoader(
             dataset,
             batch_size=BATCH_SIZE,
-            shuffle=False,  # IterableDataset doesn't support shuffle, use buffer_size if needed
+            shuffle=False if (use_distributed or cfg.dataset.streaming) else True,
+            sampler=sampler,
             collate_fn=collate_coco_batch,
             num_workers=0,  # Set to 0 for IterableDataset with streaming
-            pin_memory=True if torch.cuda.is_available() else False,
+            pin_memory=True if (torch.cuda.is_available() and device.type == "cuda") else False,
         )
         # Note: IterableDataset doesn't support len()
-        print("✓ COCO dataset loaded (streaming mode - size unknown)")
-        print("=" * 30 + "\n")
+        if is_main_process(rank):
+            print("✓ COCO dataset loaded (streaming mode - size unknown)")
+            print("=" * 30 + "\n")
     else:
-        print("\n=== Using Dummy Dataset ===")
+        if is_main_process(rank):
+            print("\n=== Using Dummy Dataset ===")
         dataset = DummySiglipDataset(
             num_samples=10000,
             img_size=IMAGE_SIZE,
@@ -469,21 +571,38 @@ def main(cfg: DictConfig) -> None:
             vocab_size=STUDENT_VOCAB_SIZE,  # Use student vocab size
             max_token_id=max_valid_token_id_student,  # Use student vocab range
         )
-        dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-        print(f"✓ Dummy dataset created: {len(dataset)} samples")
-        print("=" * 30 + "\n")
+        # Use DistributedSampler for dummy dataset if using distributed training
+        sampler = None
+        if use_distributed:
+            sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+
+        dataloader = DataLoader(
+            dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False if use_distributed else True,
+            sampler=sampler,
+        )
+        if is_main_process(rank):
+            print(f"✓ Dummy dataset created: {len(dataset)} samples")
+            print("=" * 30 + "\n")
 
     # Training loop with max_steps
-    student_model.train()
-    print(f"\nStarting training for {MAX_STEPS} steps...")
-    print("Note: If dataset ends before max_steps, it will cycle back and continue.")
+    # Get the underlying model from DDP wrapper if using distributed training
+    if use_distributed:
+        model_to_train = cast(nn.Module, student_model.module)
+    else:
+        model_to_train = student_model
+    model_to_train.train()
+    if is_main_process(rank):
+        print(f"\nStarting training for {MAX_STEPS} steps...")
+        print("Note: If dataset ends before max_steps, it will cycle back and continue.")
 
     # Create an iterator that can cycle through the dataloader
     step = 0
     dataloader_iter = iter(dataloader)
 
-    # Progress bar for steps
-    pbar = tqdm(total=MAX_STEPS, desc="Training")
+    # Progress bar for steps (only on main process)
+    pbar = tqdm(total=MAX_STEPS, desc="Training", disable=not is_main_process(rank))
 
     while step < MAX_STEPS:
         try:
@@ -492,7 +611,10 @@ def main(cfg: DictConfig) -> None:
             # Dataset exhausted, cycle back to the beginning
             dataloader_iter = iter(dataloader)
             batch = next(dataloader_iter)
-            print(f"\nDataset cycle: Restarting from beginning (step {step}/{MAX_STEPS})")
+            if use_distributed and sampler is not None:
+                sampler.set_epoch(step)  # Set epoch for DistributedSampler
+            if is_main_process(rank):
+                print(f"\nDataset cycle: Restarting from beginning (step {step}/{MAX_STEPS})")
 
         if USE_REAL_DATA:
             # COCO dataset returns a dict
@@ -535,7 +657,7 @@ def main(cfg: DictConfig) -> None:
             student_text_features,
             student_vision_raw,
             student_text_raw,
-        ) = student_model(student_images, student_text_ids)
+        ) = model_to_train(student_images, student_text_ids)
 
         # Compute loss
         loss, loss_dict = compute_total_loss(
@@ -604,7 +726,7 @@ def main(cfg: DictConfig) -> None:
                 wandb_log.update({f"eval/{k}": v for k, v in eval_metrics.items()})
             wandb.log(wandb_log, step=step)
 
-        if step % log_every_n_steps == 0:
+        if step % log_every_n_steps == 0 and is_main_process(rank):
             log_message = f"\nStep {step}/{MAX_STEPS}: Loss: {loss_dict} | LR: {current_lr:.2e}"
             if eval_metrics:
                 # Format metrics nicely
@@ -619,55 +741,64 @@ def main(cfg: DictConfig) -> None:
             print(log_message)
 
     pbar.close()
-    print(f"\nTraining completed after {step} steps!")
+    if is_main_process(rank):
+        print(f"\nTraining completed after {step} steps!")
 
     # Log final metrics to WandB
     if wandb_enabled:
         wandb.summary["final_step"] = step
         wandb.summary["total_steps"] = MAX_STEPS
-    print(f"Saving model to {checkpoint_path}...")
-    checkpoint_dict = {
-        "student_model": student_model.state_dict(),
-        "projection_v": projection_v.state_dict(),
-        "projection_t": projection_t.state_dict(),
-        "logit_scale": logit_scale.data,
-        "config": OmegaConf.to_container(cfg, resolve=True),
-    }
-    torch.save(checkpoint_dict, checkpoint_path)
-    print(f"Model saved to {checkpoint_path}")
 
-    # Save configuration to output directory
-    config_save_path = output_dir / "config.yaml"
-    OmegaConf.save(cfg, config_save_path)
-    print(f"Configuration saved to {config_save_path}")
+    # Save checkpoint only on main process
+    if is_main_process(rank):
+        print(f"Saving model to {checkpoint_path}...")
+        # Get state dict from DDP model if needed
+        model_state_dict = model_to_train.state_dict()
+        checkpoint_dict = {
+            "student_model": model_state_dict,
+            "projection_v": projection_v.state_dict(),
+            "projection_t": projection_t.state_dict(),
+            "logit_scale": logit_scale.data,
+            "config": OmegaConf.to_container(cfg, resolve=True),
+        }
+        torch.save(checkpoint_dict, checkpoint_path)
+        print(f"Model saved to {checkpoint_path}")
 
-    # Save student processor for inference (Hugging Face style)
-    print("\n=== Saving Student Processor for Inference ===")
+        # Save configuration to output directory
+        config_save_path = output_dir / "config.yaml"
+        OmegaConf.save(cfg, config_save_path)
+        print(f"Configuration saved to {config_save_path}")
 
-    if student_processor is not None:
-        # Reset augmentation to False for inference
-        if hasattr(student_processor.image_processor, "use_augmentation"):
-            student_processor.image_processor.use_augmentation = False
-            student_processor.image_processor._build_transform()
+        # Save student processor for inference (Hugging Face style)
+        print("\n=== Saving Student Processor for Inference ===")
 
-        processor_save_path = output_dir / "processor"
-        try:
-            student_processor.save_pretrained(str(processor_save_path))
-            print(f"✓ Student processor saved to {processor_save_path}")
-            print(f"  - Tokenizer: {processor_save_path / 'tokenizer'}")
-            print(f"  - Image processor: {processor_save_path / 'image_processor'}")
-        except Exception as e:
-            print(f"Warning: Could not save student processor: {e}")
-    else:
-        print("Warning: Student processor is None, skipping processor save.")
-        print("  Note: Inference will require manual tokenizer and image processor setup.")
+        if student_processor is not None:
+            # Reset augmentation to False for inference
+            if hasattr(student_processor.image_processor, "use_augmentation"):
+                student_processor.image_processor.use_augmentation = False
+                student_processor.image_processor._build_transform()
 
-    print("=" * 50)
+            processor_save_path = output_dir / "processor"
+            try:
+                student_processor.save_pretrained(str(processor_save_path))
+                print(f"✓ Student processor saved to {processor_save_path}")
+                print(f"  - Tokenizer: {processor_save_path / 'tokenizer'}")
+                print(f"  - Image processor: {processor_save_path / 'image_processor'}")
+            except Exception as e:
+                print(f"Warning: Could not save student processor: {e}")
+        else:
+            print("Warning: Student processor is None, skipping processor save.")
+            print("  Note: Inference will require manual tokenizer and image processor setup.")
 
-    # Finish WandB run
-    if wandb_enabled:
-        wandb.finish()
-        print("✓ WandB run completed")
+        print("=" * 50)
+
+        # Finish WandB run
+        if wandb_enabled:
+            wandb.finish()
+            print("✓ WandB run completed")
+
+    # Cleanup distributed training
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

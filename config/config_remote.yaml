@@ -1,0 +1,19 @@
+# TinySigLIP Training Configuration for Remote Server
+# Optimized for (8x A100 40GB GPUs)
+# Inherits from config.yaml and only overrides specific settings
+
+defaults:
+  - config  # Inherit from config.yaml
+  - _self_
+
+# Training configuration overrides for 8x A100 40GB
+# Effective batch size = batch_size × 8 GPUs = 128 × 8 = 1024
+training:
+  batch_size: 128  # Per GPU batch size (effective: 1024 with 8 GPUs)
+  max_steps: 8000  # ~1-2 epochs on COCO train set
+  learning_rate: 4.0e-4  # Scaled for large batch size (sqrt scaling: 5e-5 × sqrt(1024/16) ≈ 4e-4)
+  warmup_steps: 500  # ~6% of max_steps for stable training start
+
+# Dataset configuration overrides
+dataset:
+  split: "train"  # Use 'train' for actual training on remote server
