@@ -25,11 +25,17 @@ graph TB
         NF2 --> SIM
     end
 
-    style I fill:#e1f5ff
-    style T fill:#e1f5ff
-    style VE fill:#fff4e1
-    style TE fill:#fff4e1
-    style SIM fill:#ffe1f5
+    style I fill:#2563eb,stroke:#1e40af,stroke-width:2px,color:#fff
+    style T fill:#2563eb,stroke:#1e40af,stroke-width:2px,color:#fff
+    style VE fill:#dc2626,stroke:#b91c1c,stroke-width:2px,color:#fff
+    style TE fill:#ea580c,stroke:#c2410c,stroke-width:2px,color:#fff
+    style TP fill:#ca8a04,stroke:#a16207,stroke-width:2px,color:#fff
+    style TT fill:#16a34a,stroke:#15803d,stroke-width:2px,color:#fff
+    style VP fill:#0891b2,stroke:#0e7490,stroke-width:2px,color:#fff
+    style TP2 fill:#0891b2,stroke:#0e7490,stroke-width:2px,color:#fff
+    style NF1 fill:#7c3aed,stroke:#6d28d9,stroke-width:2px,color:#fff
+    style NF2 fill:#7c3aed,stroke:#6d28d9,stroke-width:2px,color:#fff
+    style SIM fill:#059669,stroke:#047857,stroke-width:2px,color:#fff
 ```
 
 ## Training Approach
@@ -63,24 +69,58 @@ graph LR
 
     TL --> OPT[Optimizer]
 
-    style TF fill:#ffe1f5
-    style SF fill:#e1f5ff
-    style TL fill:#fff4e1
+    style TI fill:#2563eb,stroke:#1e40af,stroke-width:2px,color:#fff
+    style TT fill:#2563eb,stroke:#1e40af,stroke-width:2px,color:#fff
+    style TF fill:#7c3aed,stroke:#6d28d9,stroke-width:2px,color:#fff
+    style SI fill:#16a34a,stroke:#15803d,stroke-width:2px,color:#fff
+    style ST fill:#16a34a,stroke:#15803d,stroke-width:2px,color:#fff
+    style SF fill:#0891b2,stroke:#0e7490,stroke-width:2px,color:#fff
+    style L1 fill:#ea580c,stroke:#c2410c,stroke-width:2px,color:#fff
+    style L2 fill:#ca8a04,stroke:#a16207,stroke-width:2px,color:#fff
+    style L3 fill:#dc2626,stroke:#b91c1c,stroke-width:2px,color:#fff
+    style TL fill:#991b1b,stroke:#7f1d1d,stroke-width:3px,color:#fff
+    style OPT fill:#059669,stroke:#047857,stroke-width:2px,color:#fff
 ```
 
 ### Loss Components
 
-1. **SigLIP Loss** ($\mathcal{L}_{SigLIP}$): Binary cross-entropy with sigmoid activation for contrastive learning
-   $$\mathcal{L}_{SigLIP} = \frac{1}{2}\left[\text{BCE}(\sigma(\mathbf{S}_{I2T}), \mathbf{Y}) + \text{BCE}(\sigma(\mathbf{S}_{T2I}), \mathbf{Y})\right]$$
+1. **SigLIP Loss** (L<sub>SigLIP</sub>): Binary cross-entropy with sigmoid activation for contrastive learning
 
-2. **Cross-Modal Distillation (CMD)** ($\mathcal{L}_{CMD}$): KL divergence between teacher and student similarity distributions
-   $$\mathcal{L}_{CMD} = \text{KL}\left(P_T(\mathbf{S}_T) \| P_S(\mathbf{S}_S)\right)$$
+   ```
+   L_SigLIP = (1/2) × [BCE(σ(S_I2T), Y) + BCE(σ(S_T2I), Y)]
+   ```
 
-3. **Uni-Modal Distillation (UMD)** ($\mathcal{L}_{UMD}$): MSE loss on normalized features from vision and text encoders
-   $$\mathcal{L}_{UMD} = \frac{1}{2}\left[\text{MSE}(\mathbf{f}_V^T, \mathbf{f}_V^S) + \text{MSE}(\mathbf{f}_T^T, \mathbf{f}_T^S)\right]$$
+   Where:
+   - `σ` is the sigmoid function
+   - `S_I2T` and `S_T2I` are similarity matrices (Image-to-Text and Text-to-Image)
+   - `Y` is the ground truth label matrix
+   - `BCE` is Binary Cross-Entropy
+
+2. **Cross-Modal Distillation (CMD)** (L<sub>CMD</sub>): KL divergence between teacher and student similarity distributions
+
+   ```
+   L_CMD = KL(P_T(S_T) || P_S(S_S))
+   ```
+
+   Where:
+   - `P_T` and `P_S` are probability distributions over teacher and student similarities
+   - `S_T` and `S_S` are similarity matrices from teacher and student models
+
+3. **Uni-Modal Distillation (UMD)** (L<sub>UMD</sub>): MSE loss on normalized features from vision and text encoders
+
+   ```
+   L_UMD = (1/2) × [MSE(f_V^T, f_V^S) + MSE(f_T^T, f_T^S)]
+   ```
+
+   Where:
+   - `f_V^T` and `f_V^S` are normalized vision features from teacher and student
+   - `f_T^T` and `f_T^S` are normalized text features from teacher and student
 
 4. **Total Loss**:
-   $$\mathcal{L}_{total} = \lambda_{SigLIP} \cdot \mathcal{L}_{SigLIP} + \lambda_{CMD} \cdot \mathcal{L}_{CMD} + \lambda_{UMD} \cdot \mathcal{L}_{UMD}$$
+
+   ```
+   L_total = λ_SigLIP × L_SigLIP + λ_CMD × L_CMD + λ_UMD × L_UMD
+   ```
 
 ## Project Structure
 
@@ -200,7 +240,7 @@ When the student model uses a smaller vocabulary than the teacher model (e.g., 3
 **Core Idea**:
 - Find **shared tokens** in student and teacher vocabularies
 - During training, continuously make student model's embeddings for these shared tokens mimic teacher model's embeddings
-- Implemented via MSE loss: $\mathcal{L}_{Emb} = \text{MSE}(\text{Emb}_S(\text{shared tokens}), \text{Emb}_T(\text{shared tokens}))$
+- Implemented via MSE loss: `L_Emb = MSE(Emb_S(shared tokens), Emb_T(shared tokens))`
 
 **Implementation**:
 - Set `USE_WEIGHT_TRANSFER = False`
