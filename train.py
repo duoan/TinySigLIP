@@ -4,7 +4,7 @@ Simplified training script for SigLIP distillation with Hydra configuration.
 
 import math
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import hydra
 import torch
@@ -31,7 +31,8 @@ except ImportError:
 from tinysiglip.coco_dataset import COCOCaptionDataset, collate_coco_batch
 from tinysiglip.embedding_distillation import (
     create_dummy_token_mapping,
-    transfer_embedding_weights_dummy,
+    create_token_mapping,
+    transfer_embedding_weights,
 )
 from tinysiglip.fake_dataset import DummySiglipDataset
 from tinysiglip.loss import compute_total_loss
@@ -121,7 +122,7 @@ def main(cfg: DictConfig) -> None:
             name=run_name,
             tags=wandb_config.get("tags", []),
             notes=wandb_config.get("notes", ""),
-            config=OmegaConf.to_container(cfg, resolve=True),
+            config=cast(dict[str, Any], OmegaConf.to_container(cfg, resolve=True)),
             dir=str(output_dir),
         )
         print(f"✓ WandB initialized: {wandb.run.url if wandb.run else 'N/A'}")
@@ -153,10 +154,10 @@ def main(cfg: DictConfig) -> None:
 
     # Load tokenizers and create student processor for real data
     student_tokenizer = None
+    teacher_tokenizer = None
     student_processor = None
     if USE_REAL_DATA:
         print("Loading tokenizers for real data...")
-        teacher_tokenizer = None
 
         # Load teacher tokenizer (from processor or separately)
         if teacher_processor is not None:
@@ -364,17 +365,28 @@ def main(cfg: DictConfig) -> None:
             teacher_embedding_dim = student_embedding_dim
         print(f"Student embedding dim: {student_embedding_dim}, Teacher embedding dim: {teacher_embedding_dim}")
 
-        # Create token mapping for dummy data (or use real tokenizers in production)
+        # Create token mapping - use real tokenizers if available, otherwise use dummy
         print("Creating token mapping...")
-        shared_student_indices, shared_teacher_indices = create_dummy_token_mapping(
-            student_vocab_size=STUDENT_VOCAB_SIZE,
-            teacher_vocab_size=cast(int, teacher_vocab_size),
-            overlap_ratio=cfg.embedding.overlap_ratio,
-        )
+        if USE_REAL_DATA and student_tokenizer is not None and teacher_tokenizer is not None:
+            # Use real tokenizers to find shared tokens
+            print("Using real tokenizers to find shared tokens...")
+            shared_student_indices, shared_teacher_indices = create_token_mapping(
+                teacher_tokenizer=teacher_tokenizer,
+                student_tokenizer=student_tokenizer,
+                verbose=True,
+            )
+        else:
+            # Fallback to dummy mapping
+            print("Using dummy token mapping (no tokenizers available or using dummy data)...")
+            shared_student_indices, shared_teacher_indices = create_dummy_token_mapping(
+                student_vocab_size=STUDENT_VOCAB_SIZE,
+                teacher_vocab_size=cast(int, teacher_vocab_size),
+                overlap_ratio=cfg.embedding.overlap_ratio,
+            )
         print(f"Shared tokens: {len(shared_student_indices)} (student) <-> {len(shared_teacher_indices)} (teacher)")
 
         # Transfer weights
-        transferred_count = transfer_embedding_weights_dummy(
+        transferred_count = transfer_embedding_weights(
             student_embedding_layer=student_embedding_layer,
             teacher_embedding_layer=teacher_embedding_layer,
             shared_student_indices=shared_student_indices,

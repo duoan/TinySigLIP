@@ -8,6 +8,60 @@ vocabularies and transfer embedding weights.
 import torch
 
 
+def create_token_mapping(
+    teacher_tokenizer,
+    student_tokenizer,
+    verbose: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Create token mapping using actual tokenizers to find shared tokens.
+
+    This function compares the vocabularies of teacher and student tokenizers
+    to find tokens that exist in both, and maps their indices accordingly.
+
+    Args:
+        teacher_tokenizer: Teacher model's tokenizer
+        student_tokenizer: Student model's tokenizer
+        verbose: Whether to print mapping statistics
+
+    Returns:
+        Tuple of (shared_token_indices_student, shared_token_indices_teacher)
+        Both are LongTensors containing the indices of shared tokens
+    """
+    # Get vocabularies
+    teacher_vocab = teacher_tokenizer.get_vocab()
+    student_vocab = student_tokenizer.get_vocab()
+
+    # Find shared tokens (tokens that exist in both vocabularies)
+    shared_tokens = []
+    shared_student_indices = []
+    shared_teacher_indices = []
+
+    for token, student_idx in student_vocab.items():
+        if token in teacher_vocab:
+            teacher_idx = teacher_vocab[token]
+            shared_tokens.append(token)
+            shared_student_indices.append(student_idx)
+            shared_teacher_indices.append(teacher_idx)
+
+    if verbose:
+        print("\n=== Token Mapping (Real Tokenizers) ===")
+        print(f"Teacher vocab size: {len(teacher_vocab)}")
+        print(f"Student vocab size: {len(student_vocab)}")
+        print(f"Shared tokens found: {len(shared_tokens)}")
+        if len(shared_tokens) > 0:
+            overlap_ratio = len(shared_tokens) / len(student_vocab)
+            print(f"Overlap ratio: {overlap_ratio:.2%}")
+            # Show some examples
+            print(f"Example shared tokens (first 10): {shared_tokens[:10]}")
+        print("==========================================\n")
+
+    return (
+        torch.tensor(shared_student_indices, dtype=torch.long),
+        torch.tensor(shared_teacher_indices, dtype=torch.long),
+    )
+
+
 def create_dummy_token_mapping(
     student_vocab_size: int, teacher_vocab_size: int, overlap_ratio: float = 0.8
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -46,7 +100,7 @@ def create_dummy_token_mapping(
     return shared_token_indices_student, shared_token_indices_teacher
 
 
-def transfer_embedding_weights_dummy(
+def transfer_embedding_weights(
     student_embedding_layer: torch.nn.Embedding,
     teacher_embedding_layer: torch.nn.Embedding,
     shared_student_indices: torch.Tensor,
@@ -54,7 +108,7 @@ def transfer_embedding_weights_dummy(
     verbose: bool = True,
 ) -> int:
     """
-    Transfer embedding weights using pre-computed token mappings (for dummy data).
+    Transfer embedding weights using pre-computed token mappings.
 
     Args:
         student_embedding_layer: Student's embedding layer
@@ -75,6 +129,12 @@ def transfer_embedding_weights_dummy(
         student_id = int(shared_student_indices[i].item())
         teacher_id = int(shared_teacher_indices[i].item())
 
+        # Validate indices
+        if student_id >= student_weight.shape[0] or teacher_id >= teacher_weight.shape[0]:
+            if verbose and transferred_count == 0:  # Only print warning once
+                print(f"Warning: Skipping invalid index pair (student_id={student_id}, teacher_id={teacher_id})")
+            continue
+
         teacher_emb = teacher_weight[teacher_id]
 
         # Handle dimension mismatch
@@ -89,8 +149,8 @@ def transfer_embedding_weights_dummy(
         transferred_count += 1
 
     if verbose:
-        print("\n=== Embedding Weight Transfer (Dummy) ===")
+        print("\n=== Embedding Weight Transfer ===")
         print(f"Transferred {transferred_count} token embeddings")
-        print("==========================================\n")
+        print("==================================\n")
 
     return transferred_count

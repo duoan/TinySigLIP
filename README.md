@@ -253,7 +253,7 @@ graph TB
 
 - `tinysiglip/model.py`: Student model definition (uses `timm` for vision encoder)
 - `tinysiglip/loss.py`: Distillation loss functions (SigLIP loss + CMD + UMD + Embedding Mimicking)
-- `tinysiglip/embedding_distillation.py`: Token Embedding Layer distillation utilities
+- `tinysiglip/embedding_distillation.py`: Token embedding layer distillation utilities (token mapping and weight transfer)
 - `tinysiglip/coco_dataset.py`: COCO dataset implementation
 - `tinysiglip/fake_dataset.py`: Dummy dataset for testing
 - `tinysiglip/processor.py`: Data preprocessing utilities
@@ -292,13 +292,17 @@ See `config/config.yaml` for full configuration options.
 
 The student model can use a different vocabulary size than the teacher model, which is useful for creating smaller English-specific models.
 
-**Note**: In real applications (with actual text data), you need to:
-1. Create/select a tokenizer for the student model (e.g., sentencepiece, BPE)
-2. Use different tokenizers to convert the same text to different token IDs
-3. Student model uses student tokenizer's token IDs
-4. Teacher model uses teacher tokenizer's token IDs
+**How it works**:
+1. When using real data (`USE_REAL_DATA=True`), the code automatically:
+   - Loads teacher and student tokenizers
+   - Finds shared tokens between vocabularies using `create_token_mapping()`
+   - Transfers embedding weights for shared tokens using `transfer_embedding_weights()`
+2. When using dummy data (`USE_REAL_DATA=False`), the code uses `create_dummy_token_mapping()` for testing purposes
 
-The current code uses dummy data. For demonstration and testing, both models use the same token ID range.
+**For real applications**:
+- Set `USE_REAL_DATA=True` in the configuration
+- Specify `student.tokenizer_name` if using a different tokenizer than the teacher
+- The training script automatically handles tokenizer loading and token mapping
 
 ## Token Embedding Layer Distillation / Weight Transfer
 
@@ -333,24 +337,34 @@ When the student model uses a smaller vocabulary than the teacher model (e.g., 3
 
 ### Using Real Tokenizers
 
-In real applications, you can use actual tokenizers for weight transfer:
+In real applications, you can use actual tokenizers to find shared tokens and transfer weights:
 
 ```python
-from tinysiglip.embedding_distillation import transfer_embedding_weights
+from tinysiglip.embedding_distillation import create_token_mapping, transfer_embedding_weights
 from transformers import AutoTokenizer
 
 # Load tokenizers
 student_tokenizer = AutoTokenizer.from_pretrained("your-student-tokenizer")
 teacher_tokenizer = AutoTokenizer.from_pretrained(TEACHER_MODEL_NAME)
 
-# Execute weight transfer
-transfer_embedding_weights(
+# Step 1: Find shared tokens between vocabularies
+shared_student_indices, shared_teacher_indices = create_token_mapping(
+    teacher_tokenizer=teacher_tokenizer,
+    student_tokenizer=student_tokenizer,
+    verbose=True,
+)
+
+# Step 2: Transfer weights for shared tokens
+transferred_count = transfer_embedding_weights(
     student_embedding_layer=student_model.text_embedding,
     teacher_embedding_layer=teacher_model.text_model.embeddings.token_embedding,
-    student_tokenizer=student_tokenizer,
-    teacher_tokenizer=teacher_tokenizer,
+    shared_student_indices=shared_student_indices,
+    shared_teacher_indices=shared_teacher_indices,
+    verbose=True,
 )
 ```
+
+**Note**: The training script (`train.py`) automatically uses real tokenizers when `USE_REAL_DATA=True` and tokenizers are available. Otherwise, it falls back to dummy token mapping for testing purposes.
 
 ## Ablation Study
 
