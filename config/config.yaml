@@ -20,9 +20,9 @@ training:
   batch_size: 16
   image_size: 224
   text_seq_len: 64
-  max_steps: 1000
+  num_epochs: 10  # Number of training epochs
   learning_rate: 5.0e-5
-  warmup_steps: 100
+  warmup_epochs: 1  # Number of warmup epochs (will be converted to steps based on dataset size)
   use_cosine_scheduler: true
 
 # Loss configuration
@@ -35,11 +35,11 @@ loss:
 # Dataset configuration
 dataset:
   use_real_data: true
-  split: "train"  # 'val' or 'test' or 'train'
+  split: "val"  # 'val' or 'test' or 'train' - use 'val' for local development/testing
   cache_dir: null
   use_augmentation: true
-  streaming: true
-  num_workers: 0  # Number of data loading workers (0 for streaming IterableDataset, can be >0 for regular Dataset)
+  streaming: false  # Use non-streaming mode (required for epoch-based training)
+  num_workers: 4  # Number of data loading workers (can be >0 for non-streaming Dataset)
   coco_root: "data/coco/images"  # Root directory where COCO images are stored (default: relative to project root)
   coco_ann_file: "data/coco/annotations/captions_train2017.json"  # Path to COCO annotation JSON file (default: relative to project root)
 
@@ -61,7 +61,7 @@ logging:
 # Early stopping configuration
 early_stopping:
   enabled: true  # Enable early stopping
-  patience: 10  # Number of steps to wait before stopping if no improvement (local: 10, remote: 100)
+  patience: 500  # Number of steps to wait before stopping if no improvement
   min_delta: 0.001  # Minimum change to qualify as an improvement
   monitor: "weighted"  # Metric to monitor: "weighted" (total loss), "siglip", "cmd", "umd"
   mode: "min"  # "min" for loss (lower is better), "max" for metrics (higher is better)
