@@ -1,13 +1,121 @@
 # TinySigLIP
 
-A SigLIP model distillation implementation based on the TinyCLIP approach, using the `timm` library to construct the student model.
+📌 A knowledge distillation framework for creating compact vision-language models, inspired by [TinyCLIP](https://github.com/wkcn/TinyCLIP). TinySigLIP distills knowledge from large SigLIP teacher models to smaller, efficient student models while maintaining competitive performance.
 
-## Overview
+## Highlights
 
-TinySigLIP is a knowledge distillation framework for creating compact vision-language models by distilling knowledge from large SigLIP teacher models to smaller student models. The framework supports multiple distillation strategies including cross-modal distillation (CMD), uni-modal distillation (UMD), and embedding layer knowledge transfer.
+* 🎯 **Efficient Distillation**: Multiple distillation strategies for effective knowledge transfer
+* 📉 **Parameter Efficient**: Support for smaller vocabularies, saving **~86M parameters** compared to full models
+* ⚡ **Fast Inference**: Compact models with faster inference speed
+* 🔄 **Easy to Use**: Simple training and evaluation pipeline
+* 📊 **Experiment Tracking**: Real-time training metrics with [Weights & Biases](https://wandb.ai/ReproduceAI/tinysiglip/) integration
 
+## News
 
+* *Coming Soon*: Model Zoo with pre-trained checkpoints
+* *In Progress*: Training and evaluation on large-scale datasets
 
+## Model Zoo
+
+Pre-trained models will be released here. Checkpoints are currently under development.
+
+| Model | Teacher | Student Vision | Student Text | ImageNet-1K Zero-shot | Parameters | Status |
+|-------|---------|----------------|--------------|----------------------|------------|--------|
+| [TinySigLIP-ViT-Tiny] | SigLIP-Base | ViT-Tiny/16 | 19M | [To be filled] | ~39M | 🚧 Training |
+| [TinySigLIP-ViT-Small] | SigLIP-Base | ViT-Small/16 | 19M | [To be filled] | ~60M | 📋 Planned |
+| [TinySigLIP-ResNet] | SigLIP-Base | ResNet-50 | 19M | [To be filled] | ~45M | 📋 Planned |
+
+> **Note**: Model checkpoints will be available soon. Training progress can be monitored on [W&B Dashboard](https://wandb.ai/ReproduceAI/tinysiglip/).
+
+## Experiment Tracking
+
+Training progress and metrics are tracked using [Weights & Biases](https://wandb.ai). View the experiment dashboard:
+
+🔗 **[View Experiments on W&B](https://wandb.ai/ReproduceAI/tinysiglip/)**
+
+The dashboard includes real-time training metrics, loss curves, model checkpoints, and hyperparameter configurations for all experiments.
+
+## Getting Started
+
+🔰 Here is the setup tutorial, evaluation and training scripts.
+
+### Installation
+
+Install dependencies:
+
+```bash
+# Using uv (recommended)
+uv sync
+
+# Or using pip
+pip install -r requirements.txt
+```
+
+### Quick Start
+
+**1. Training**
+
+Start training with default configuration:
+
+```bash
+python train.py
+```
+
+The training script uses Hydra for configuration management. Modify `config/config.yaml` to adjust hyperparameters.
+
+**Note**: Training metrics are automatically logged to [Weights & Biases](https://wandb.ai/ReproduceAI/tinysiglip/). Make sure you have configured your W&B API key if you want to track experiments:
+```bash
+wandb login
+```
+
+**2. Evaluation**
+
+Evaluate your trained model on ImageNet-1k zero-shot classification:
+
+```bash
+python eval_imagenet1k.py \
+    --imagenet-val /path/to/imagenet/val \
+    --resume /path/to/checkpoint.pt \
+    --batch-size 32 \
+    --num-workers 4
+```
+
+**Arguments:**
+- `--imagenet-val`: Path to ImageNet validation set directory
+- `--resume`: Path to checkpoint file (`.pt` file saved during training)
+- `--batch-size`: Batch size for evaluation (default: 32)
+- `--num-workers`: Number of data loading workers (default: 4)
+- `--device`: Device to use (default: `cuda`)
+- `--logit-scale`: Optional logit scale (temperature). If not specified, uses value from checkpoint.
+
+**Example:**
+```bash
+# Evaluate a trained model
+python eval_imagenet1k.py \
+    --imagenet-val ./ImageNet \
+    --resume ./outputs/2025-11-29_20-15-10/checkpoint.pt \
+    --batch-size 64
+```
+
+The evaluation script will:
+1. Load the checkpoint and restore model configuration
+2. Load or create the processor from checkpoint directory
+3. Generate text prompts for all 1000 ImageNet classes (e.g., "a photo of a {class_name}")
+4. Compute text features for all classes
+5. Evaluate on ImageNet validation set and report Top-1 and Top-5 accuracy
+
+**Note**: The checkpoint directory should contain a `processor/` subdirectory (saved automatically during training) for proper text tokenization. If not available, the script will attempt to create a processor from the checkpoint configuration.
+
+**3. Image-Text Retrieval Evaluation**
+
+Evaluate image-text retrieval performance:
+
+```bash
+python eval_retrieval.py \
+    --checkpoint /path/to/checkpoint.pt \
+    --image-dir /path/to/images \
+    --text-file /path/to/captions.txt
+```
 
 ## Model Architecture
 
@@ -151,77 +259,34 @@ graph TB
 - `tinysiglip/processor.py`: Data preprocessing utilities
 - `tinysiglip/metrics.py`: Evaluation metrics
 - `train.py`: Training script with Hydra configuration
-
-## Usage
-
-### Training
-
-```bash
-python train.py
-```
-
-The training script uses Hydra for configuration management. Modify `config/config.yaml` to adjust hyperparameters.
-
-### Evaluation
-
-Evaluate your trained model on ImageNet-1k zero-shot classification:
-
-```bash
-python eval_imagenet1k.py \
-    --imagenet-val /path/to/imagenet/val \
-    --resume /path/to/checkpoint.pt \
-    --batch-size 32 \
-    --num-workers 4
-```
-
-**Arguments:**
-- `--imagenet-val`: Path to ImageNet validation set directory
-- `--resume`: Path to checkpoint file (`.pt` file saved during training)
-- `--batch-size`: Batch size for evaluation (default: 32)
-- `--num-workers`: Number of data loading workers (default: 4)
-- `--device`: Device to use (default: `cuda`)
-- `--logit-scale`: Optional logit scale (temperature). If not specified, uses value from checkpoint.
-
-**Example:**
-```bash
-# Evaluate a trained model
-python eval_imagenet1k.py \
-    --imagenet-val ./ImageNet \
-    --resume ./outputs/2025-11-29_20-15-10/checkpoint.pt \
-    --batch-size 64
-```
-
-The evaluation script will:
-1. Load the checkpoint and restore model configuration
-2. Load or create the processor from checkpoint directory
-3. Generate text prompts for all 1000 ImageNet classes (e.g., "a photo of a {class_name}")
-4. Compute text features for all classes
-5. Evaluate on ImageNet validation set and report Top-1 and Top-5 accuracy
-
-**Note**: The checkpoint directory should contain a `processor/` subdirectory (saved automatically during training) for proper text tokenization. If not available, the script will attempt to create a processor from the checkpoint configuration.
-
-## Key Features
-
-1. **Timm-based Student Model**: No need for custom model architecture; directly use pre-trained models from `timm`
-2. **SigLIP Distillation**:
-   - SigLIP loss (sigmoid-based contrastive loss)
-   - Cross-modal distillation loss (CMD)
-   - Uni-modal feature distillation loss (UMD)
-   - **Token Embedding Layer Distillation** (Embedding Mimicking Loss)
-3. **Vocabulary Optimization**: Support for student models using smaller English-specific vocabularies (e.g., 32K vs 256K), significantly reducing parameters
-4. **Simplified Design**: Clear code structure, easy to understand and modify
+- `eval_imagenet1k.py`: ImageNet-1K zero-shot classification evaluation
+- `eval_retrieval.py`: Image-text retrieval evaluation
 
 ## Configuration
 
-You can modify the following in `config/config.yaml`:
+Modify `config/config.yaml` to customize training:
 
-- **Teacher Model**: `teacher.model_name` (default: `google/siglip-base-patch16-224`)
-- **Student Vision Model**: `student.vision_model_name` (timm model name, e.g., `vit_tiny_patch16_224`)
-- **Student Vocabulary Size**: `student.vocab_size` (default: 32000, for English-only models)
-  - Can be set smaller than teacher model to save parameters
-  - Common sizes: 32000 (English BPE), 50257 (GPT-2), 49152 (English CLIP)
+### Key Configuration Options
+
+- **Teacher Model** (`teacher.model_name`):
+  - Default: `google/siglip-base-patch16-224`
+  - Any SigLIP model from HuggingFace can be used
+
+- **Student Vision Model** (`student.vision_model_name`):
+  - Any `timm` model name (e.g., `vit_tiny_patch16_224`, `resnet50`, `efficientnet_b0`)
+  - Pre-trained weights will be loaded automatically
+
+- **Student Vocabulary Size** (`student.vocab_size`):
+  - Default: `32000` (for English-only models)
+  - Can be set smaller than teacher model to save parameters (e.g., 32K vs 256K saves ~86M params)
+  - Common sizes: `32000` (English BPE), `50257` (GPT-2), `49152` (English CLIP)
   - Set to `null` to use the same vocabulary size as teacher model
-- **Training Hyperparameters**: Batch size, learning rate, etc.
+
+- **Training Hyperparameters**:
+  - Batch size, learning rate, warmup steps, etc.
+  - Loss weights: `lambda_siglip`, `lambda_cmd`, `lambda_umd`
+
+See `config/config.yaml` for full configuration options.
 
 ## Different Vocabulary Sizes
 
