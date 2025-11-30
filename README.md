@@ -6,25 +6,38 @@ A SigLIP model distillation implementation based on the TinyCLIP approach, using
 
 TinySigLIP is a knowledge distillation framework for creating compact vision-language models by distilling knowledge from large SigLIP teacher models to smaller student models. The framework supports multiple distillation strategies including cross-modal distillation (CMD), uni-modal distillation (UMD), and embedding layer knowledge transfer.
 
+
+
+
 ## Model Architecture
+
+
 
 The student model consists of a vision encoder (from `timm`) and a lightweight text encoder:
 
 ```mermaid
 graph TB
-    subgraph "Student Model"
+    subgraph Vision["Vision Path"]
+        direction TB
         I[Input Images<br/>B×3×H×W] --> VE[Vision Encoder<br/>timm backbone]
+        VE --> VP[Vision Projection<br/>Linear]
+        VP --> NF1[L2 Normalize]
+    end
+
+    subgraph Text["Text Path"]
+        direction TB
         T[Input Text IDs<br/>B×seq_len] --> TE[Text Embedding<br/>vocab_size×dim]
         TE --> TP[Positional Embedding]
         TP --> TT[Text Transformer<br/>L layers]
-        VE --> VP[Vision Projection<br/>Linear]
         TT --> TP2[Text Projection<br/>Linear]
-        VP --> NF1[L2 Normalize]
         TP2 --> NF2[L2 Normalize]
-        NF1 --> SIM[Similarity Matrix<br/>B×B]
-        NF2 --> SIM
     end
 
+    NF1 --> SIM[Similarity Matrix<br/>B×B]
+    NF2 --> SIM
+
+    style Vision fill:#f8fafc,stroke:#dc2626,stroke-width:3px
+    style Text fill:#f8fafc,stroke:#16a34a,stroke-width:3px
     style I fill:#2563eb,stroke:#1e40af,stroke-width:2px,color:#fff
     style T fill:#2563eb,stroke:#1e40af,stroke-width:2px,color:#fff
     style VE fill:#dc2626,stroke:#b91c1c,stroke-width:2px,color:#fff
@@ -38,18 +51,22 @@ graph TB
     style SIM fill:#059669,stroke:#047857,stroke-width:2px,color:#fff
 ```
 
+
+
 ## Training Approach
 
 The distillation process uses multiple loss components to transfer knowledge from teacher to student:
 
 ```mermaid
-graph LR
-    subgraph "Teacher Model"
+graph TB
+    subgraph T["Teacher Model"]
+        direction TB
         TI[Teacher Images] --> TF[Teacher Features]
         TT[Teacher Text] --> TF
     end
 
-    subgraph "Student Model"
+    subgraph S["Student Model"]
+        direction TB
         SI[Student Images] --> SF[Student Features]
         ST[Student Text] --> SF
     end
@@ -69,6 +86,8 @@ graph LR
 
     TL --> OPT[Optimizer]
 
+    style T fill:#f8fafc,stroke:#7c3aed,stroke-width:3px
+    style S fill:#f8fafc,stroke:#2563eb,stroke-width:3px
     style TI fill:#2563eb,stroke:#1e40af,stroke-width:2px,color:#fff
     style TT fill:#2563eb,stroke:#1e40af,stroke-width:2px,color:#fff
     style TF fill:#7c3aed,stroke:#6d28d9,stroke-width:2px,color:#fff
