@@ -1,0 +1,24 @@
+# TinySigLIP Training Configuration for Google Colab T4
+# T4 has 16GB VRAM, single GPU
+# Inherits from config.yaml and only overrides specific settings
+
+defaults:
+  - config  # Inherit from config.yaml
+  - _self_
+
+# Training configuration overrides for T4 (16GB VRAM)
+training:
+  batch_size: 32  # Per GPU batch size (T4 has 16GB, can handle moderate batch size)
+  max_steps: 5000  # Reasonable number of steps for Colab
+  learning_rate: 5.0e-5  # Standard learning rate for single GPU
+  warmup_steps: 200  # ~4% of max_steps
+
+# Dataset configuration overrides
+dataset:
+  split: "val"  # Use 'val' for Colab (smaller dataset, faster)
+  streaming: true  # Keep streaming to save memory
+  num_workers: 2  # Limited workers for Colab (2-4 is usually safe)
+
+# Early stopping configuration
+early_stopping:
+  patience: 50  # Moderate patience for Colab

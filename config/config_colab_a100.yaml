@@ -1,0 +1,24 @@
+# TinySigLIP Training Configuration for Single A100 (40GB VRAM)
+# Inherits from config.yaml and only overrides specific settings
+
+defaults:
+  - config  # Inherit from config.yaml
+  - _self_
+
+# Training configuration overrides for A100 (40GB VRAM)
+# Effective batch size = batch_size × 1 GPU
+training:
+  batch_size: 256  # Per GPU batch size (A100 40GB can handle large batches)
+  max_steps: 10000  # More steps for single GPU training
+  learning_rate: 3.0e-4  # Scaled for larger batch size (sqrt scaling: 5e-5 × sqrt(256/16) ≈ 2e-4, use 3e-4)
+  warmup_steps: 500  # ~5% of max_steps
+
+# Dataset configuration overrides
+dataset:
+  split: "train"  # Use 'train' for actual training
+  streaming: false  # Disable streaming to allow more num_workers
+  num_workers: 8  # More workers for faster data loading
+
+# Early stopping configuration
+early_stopping:
+  patience: 200  # More patience for longer training

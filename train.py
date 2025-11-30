@@ -581,9 +581,12 @@ def main(cfg: DictConfig) -> None:
             num_workers=effective_num_workers,
             pin_memory=True if (torch.cuda.is_available() and device.type == "cuda") else False,
         )
-        # Note: IterableDataset doesn't support len()
+        # Print dataset info
         if is_main_process(rank):
-            print("✓ COCO dataset loaded (streaming mode - size unknown)")
+            if cfg.dataset.streaming:
+                print("✓ COCO dataset loaded (streaming mode - size unknown)")
+            else:
+                print(f"✓ COCO dataset loaded: {len(dataset)} samples")
             print("=" * 30 + "\n")
     else:
         if is_main_process(rank):
