@@ -569,6 +569,8 @@ def main(cfg: DictConfig) -> None:
             streaming=USE_STREAMING,
             coco_root=COCO_ROOT,
             coco_ann_file=COCO_ANN_FILE,
+            verbose=is_main_process(rank),  # Only print verbose messages on main process
+            is_main_process=is_main_process(rank),  # Only main process builds index cache
         )
         # Use DistributedSampler for distributed training
         sampler = None

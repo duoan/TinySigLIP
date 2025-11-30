@@ -4,7 +4,11 @@ Uses torchvision.datasets.CocoCaptions as the underlying dataset.
 Expands multiple captions per image.
 """
 
+import hashlib
 import os
+import pickle
+import time
+from pathlib import Path
 
 import torch
 import torchvision.datasets as dset
@@ -33,6 +37,7 @@ class COCOCaptionIterableDataset(IterableDataset):
         use_augmentation: bool = False,
         coco_root: str | None = None,
         coco_ann_file: str | None = None,
+        verbose: bool = True,  # Whether to print verbose messages (set to False in distributed training)
     ):
         """
         Args:
@@ -46,6 +51,7 @@ class COCOCaptionIterableDataset(IterableDataset):
             use_augmentation: Whether to use data augmentation (only for training)
             coco_root: Root directory where COCO images are stored
             coco_ann_file: Path to COCO annotation JSON file
+            verbose: Whether to print verbose messages (set to False in distributed training)
         """
         self.split = split
         self.image_size = image_size
@@ -58,7 +64,8 @@ class COCOCaptionIterableDataset(IterableDataset):
             self.student_processor = student_processor
         elif student_tokenizer is not None:
             # Backward compatibility: create processor from tokenizer
-            print("Warning: student_tokenizer is deprecated. Use student_processor instead.")
+            if verbose:
+                print("Warning: student_tokenizer is deprecated. Use student_processor instead.")
             from tinysiglip.processor import TinySiglipProcessor
 
             self.student_processor = TinySiglipProcessor(
@@ -100,10 +107,11 @@ class COCOCaptionIterableDataset(IterableDataset):
         # If root points to images/, torchvision will look for images/train2017/xxxx.jpg
         # However, some annotation files might have paths without the split prefix
         # So we try both: root pointing to images/ and root pointing to the split directory
-        print(f"Loading COCO Caption 2017 {split} split using torchvision...")
-        print(f"  Image root: {coco_root}")
-        print(f"  Annotation file: {coco_ann_file}")
-        print(f"  Split directory: {split_dir}")
+        if verbose:
+            print(f"Loading COCO Caption 2017 {split} split using torchvision...")
+            print(f"  Image root: {coco_root}")
+            print(f"  Annotation file: {coco_ann_file}")
+            print(f"  Split directory: {split_dir}")
 
         # Try with root pointing to images/ directory first (standard COCO format)
         try:
@@ -117,8 +125,9 @@ class COCOCaptionIterableDataset(IterableDataset):
                 try:
                     _ = self.dataset[0]
                 except Exception as e:
-                    print(f"  Warning: Failed to load image with root={coco_root}: {e}")
-                    print("  Trying with root pointing to split directory...")
+                    if verbose:
+                        print(f"  Warning: Failed to load image with root={coco_root}: {e}")
+                        print("  Trying with root pointing to split directory...")
                     # Fallback: try with root pointing to split directory
                     self.dataset = dset.CocoCaptions(
                         root=split_dir,  # Points to images/train2017/ directory
@@ -126,16 +135,18 @@ class COCOCaptionIterableDataset(IterableDataset):
                         transform=None,
                     )
         except Exception as e:
-            print(f"  Warning: Failed to load with root={coco_root}: {e}")
-            print("  Trying with root pointing to split directory...")
+            if verbose:
+                print(f"  Warning: Failed to load with root={coco_root}: {e}")
+                print("  Trying with root pointing to split directory...")
             # Fallback: try with root pointing to split directory
             self.dataset = dset.CocoCaptions(
                 root=split_dir,  # Points to images/train2017/ directory
                 annFile=coco_ann_file,
                 transform=None,
             )
-        print(f"✓ Loaded {len(self.dataset)} images from COCO dataset")
-        print("Note: Each image may have multiple captions, so actual samples will be more")
+        if verbose:
+            print(f"✓ Loaded {len(self.dataset)} images from COCO dataset")
+            print("Note: Each image may have multiple captions, so actual samples will be more")
 
     def _get_captions(self, target):
         """Extract all captions from torchvision CocoCaptions target (list of strings)."""
@@ -278,6 +289,8 @@ class COCOCaptionDataset(Dataset):
         use_augmentation: bool = False,
         coco_root: str | None = None,
         coco_ann_file: str | None = None,
+        verbose: bool = True,  # Whether to print verbose messages (set to False in distributed training)
+        is_main_process: bool = True,  # Whether this is the main process (for distributed training)
     ):
         """
         Args:
@@ -287,22 +300,34 @@ class COCOCaptionDataset(Dataset):
             student_tokenizer: Deprecated - use student_processor instead
             teacher_processor: SigLIPProcessor for teacher model (handles both image and text)
             max_seq_len: Maximum sequence length for text
-            cache_dir: Directory to cache the dataset (not used with torchvision)
+            cache_dir: Directory to cache the dataset and index (for distributed training)
             use_augmentation: Whether to use data augmentation (only for training)
             coco_root: Root directory where COCO images are stored
             coco_ann_file: Path to COCO annotation JSON file
+            verbose: Whether to print verbose messages (set to False in distributed training)
+            is_main_process: Whether this is the main process (for distributed training)
         """
         self.split = split
         self.image_size = image_size
         self.teacher_processor = teacher_processor
         self.max_seq_len = max_seq_len
         self.use_augmentation = use_augmentation
+        self.verbose = verbose
+        self.cache_dir = cache_dir
+        self.is_main_process = is_main_process
+        self.coco_root = coco_root  # Store for cache path generation
+        self.coco_ann_file = coco_ann_file  # Store for cache path generation
+        self.cache_dir = cache_dir
+        self.is_main_process = is_main_process
+        self.coco_root = coco_root  # Store for cache path generation
+        self.coco_ann_file = coco_ann_file  # Store for cache path generation
 
         # Handle student processor
         if student_processor is not None:
             self.student_processor = student_processor
         elif student_tokenizer is not None:
-            print("Warning: student_tokenizer is deprecated. Use student_processor instead.")
+            if verbose:
+                print("Warning: student_tokenizer is deprecated. Use student_processor instead.")
             from tinysiglip.processor import TinySiglipProcessor
 
             self.student_processor = TinySiglipProcessor(
@@ -344,10 +369,11 @@ class COCOCaptionDataset(Dataset):
         # If root points to images/, torchvision will look for images/train2017/xxxx.jpg
         # However, some annotation files might have paths without the split prefix
         # So we try both: root pointing to images/ and root pointing to the split directory
-        print(f"Loading COCO Caption 2017 {split} split using torchvision...")
-        print(f"  Image root: {coco_root}")
-        print(f"  Annotation file: {coco_ann_file}")
-        print(f"  Split directory: {split_dir}")
+        if verbose:
+            print(f"Loading COCO Caption 2017 {split} split using torchvision...")
+            print(f"  Image root: {coco_root}")
+            print(f"  Annotation file: {coco_ann_file}")
+            print(f"  Split directory: {split_dir}")
 
         # Try with root pointing to images/ directory first (standard COCO format)
         try:
@@ -361,8 +387,9 @@ class COCOCaptionDataset(Dataset):
                 try:
                     _ = self.coco_dataset[0]
                 except Exception as e:
-                    print(f"  Warning: Failed to load image with root={coco_root}: {e}")
-                    print("  Trying with root pointing to split directory...")
+                    if verbose:
+                        print(f"  Warning: Failed to load image with root={coco_root}: {e}")
+                        print("  Trying with root pointing to split directory...")
                     # Fallback: try with root pointing to split directory
                     self.coco_dataset = dset.CocoCaptions(
                         root=split_dir,  # Points to images/train2017/ directory
@@ -370,26 +397,144 @@ class COCOCaptionDataset(Dataset):
                         transform=None,
                     )
         except Exception as e:
-            print(f"  Warning: Failed to load with root={coco_root}: {e}")
-            print("  Trying with root pointing to split directory...")
+            if verbose:
+                print(f"  Warning: Failed to load with root={coco_root}: {e}")
+                print("  Trying with root pointing to split directory...")
             # Fallback: try with root pointing to split directory
             self.coco_dataset = dset.CocoCaptions(
                 root=split_dir,  # Points to images/train2017/ directory
                 annFile=coco_ann_file,
                 transform=None,
             )
-        print(f"✓ Loaded {len(self.coco_dataset)} images from COCO dataset")
+        if verbose:
+            print(f"✓ Loaded {len(self.coco_dataset)} images from COCO dataset")
 
         # Build index mapping: (image_idx, caption_idx) -> sample_idx
         # This allows us to expand multiple captions per image
-        self.sample_indices = []
-        for img_idx in range(len(self.coco_dataset)):
-            image, target = self.coco_dataset[img_idx]
-            num_captions = len(target) if isinstance(target, list) else 1
-            for cap_idx in range(num_captions):
-                self.sample_indices.append((img_idx, cap_idx))
+        # In distributed training, only main process builds the index and caches it
+        # Other processes wait and load from cache
+        self.sample_indices = self._build_or_load_index(
+            cache_dir=self.cache_dir,
+            is_main_process=self.is_main_process,
+            verbose=verbose,
+        )
 
-        print(f"✓ Expanded to {len(self.sample_indices)} samples (multiple captions per image)")
+        if verbose:
+            print(f"✓ Expanded to {len(self.sample_indices)} samples (multiple captions per image)")
+
+    def _get_index_cache_path(self, cache_dir: str | None) -> Path | None:
+        """Generate cache file path for the index."""
+        if cache_dir is None:
+            return None
+
+        # Create a hash based on dataset configuration to ensure cache invalidation
+        config_str = f"{self.split}_{self.coco_root}_{self.coco_ann_file}"
+        config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
+        cache_file = Path(cache_dir) / "coco_index_cache" / f"index_{self.split}_{config_hash}.pkl"
+        return cache_file
+
+    def _build_or_load_index(
+        self, cache_dir: str | None, is_main_process: bool, verbose: bool
+    ) -> list[tuple[int, int]]:
+        """
+        Build index mapping or load from cache.
+
+        In distributed training:
+        - Main process builds the index and saves to cache
+        - Other processes wait for cache file and load it
+        """
+        cache_path = self._get_index_cache_path(cache_dir)
+
+        # Try to load from cache first
+        if cache_path and cache_path.exists():
+            if verbose:
+                print(f"Loading index from cache: {cache_path}")
+            try:
+                with open(cache_path, "rb") as f:
+                    sample_indices = pickle.load(f)
+                if verbose:
+                    print(f"✓ Loaded {len(sample_indices)} index entries from cache")
+                return sample_indices
+            except Exception as e:
+                if verbose:
+                    print(f"Warning: Failed to load cache: {e}. Rebuilding index...")
+
+        # Build index
+        if is_main_process:
+            if verbose:
+                print("Building index mapping (this may take a while)...")
+            sample_indices = []
+            for img_idx in range(len(self.coco_dataset)):
+                if verbose and img_idx % 1000 == 0 and img_idx > 0:
+                    print(f"  Processing image {img_idx}/{len(self.coco_dataset)}...")
+                try:
+                    _, target = self.coco_dataset[img_idx]
+                    num_captions = len(target) if isinstance(target, list) else 1
+                    for cap_idx in range(num_captions):
+                        sample_indices.append((img_idx, cap_idx))
+                except Exception as e:
+                    if verbose:
+                        print(f"  Warning: Failed to process image {img_idx}: {e}. Skipping.")
+                    continue
+
+            # Save to cache
+            if cache_path:
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(cache_path, "wb") as f:
+                        pickle.dump(sample_indices, f)
+                    if verbose:
+                        print(f"✓ Saved index to cache: {cache_path}")
+                except Exception as e:
+                    if verbose:
+                        print(f"Warning: Failed to save cache: {e}")
+
+            return sample_indices
+        else:
+            # Non-main process: wait for cache file to be created
+            if cache_path:
+                if verbose:
+                    print("Waiting for index cache to be created by main process...")
+                max_wait_time = 300  # 5 minutes
+                wait_interval = 1  # 1 second
+                waited = 0
+                while waited < max_wait_time:
+                    if cache_path.exists():
+                        try:
+                            with open(cache_path, "rb") as f:
+                                sample_indices = pickle.load(f)
+                            if verbose:
+                                print(f"✓ Loaded {len(sample_indices)} index entries from cache")
+                            return sample_indices
+                        except Exception:
+                            # File might be incomplete, wait a bit more
+                            time.sleep(wait_interval)
+                            waited += wait_interval
+                            continue
+                    time.sleep(wait_interval)
+                    waited += wait_interval
+
+                # If cache still doesn't exist after waiting, build it ourselves
+                if verbose:
+                    print("Warning: Cache file not found after waiting. Building index on this process...")
+            else:
+                # No cache directory, build index anyway
+                if verbose:
+                    print("No cache directory specified. Building index on this process...")
+
+            # Fallback: build index on this process too
+            sample_indices = []
+            for img_idx in range(len(self.coco_dataset)):
+                try:
+                    _, target = self.coco_dataset[img_idx]
+                    num_captions = len(target) if isinstance(target, list) else 1
+                    for cap_idx in range(num_captions):
+                        sample_indices.append((img_idx, cap_idx))
+                except Exception as e:
+                    if verbose:
+                        print(f"Warning: Failed to process image {img_idx}: {e}. Skipping.")
+                    continue
+            return sample_indices
 
     def _get_captions(self, target):
         """Extract all captions from torchvision CocoCaptions target (list of strings)."""
@@ -510,6 +655,8 @@ def COCOCaptionDatasetFactory(
     streaming: bool = True,
     coco_root: str | None = None,
     coco_ann_file: str | None = None,
+    verbose: bool = True,  # Whether to print verbose messages (set to False in distributed training)
+    is_main_process: bool = True,  # Whether this is the main process (for distributed training)
 ):
     """
     Factory function to create the appropriate dataset class based on streaming mode.
@@ -519,6 +666,8 @@ def COCOCaptionDatasetFactory(
                   If False, returns COCOCaptionDataset (non-streaming mode)
         coco_root: Root directory where COCO images are stored
         coco_ann_file: Path to COCO annotation JSON file
+        verbose: Whether to print verbose messages (set to False in distributed training)
+        is_main_process: Whether this is the main process (for distributed training)
         Other args: Same as dataset classes
     """
     if streaming:
@@ -533,6 +682,7 @@ def COCOCaptionDatasetFactory(
             use_augmentation=use_augmentation,
             coco_root=coco_root,
             coco_ann_file=coco_ann_file,
+            verbose=verbose,
         )
     else:
         return COCOCaptionDataset(
@@ -546,6 +696,8 @@ def COCOCaptionDatasetFactory(
             use_augmentation=use_augmentation,
             coco_root=coco_root,
             coco_ann_file=coco_ann_file,
+            verbose=verbose,
+            is_main_process=is_main_process,
         )
 
 
