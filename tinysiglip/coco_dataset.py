@@ -96,17 +96,44 @@ class COCOCaptionIterableDataset(IterableDataset):
             )
 
         # Load dataset using torchvision
-        # root should point to the images directory (not the specific split directory)
-        # because annotation files contain paths like "train2017/xxxx.jpg"
+        # For COCO, the annotation file contains paths like "train2017/xxxx.jpg"
+        # If root points to images/, torchvision will look for images/train2017/xxxx.jpg
+        # However, some annotation files might have paths without the split prefix
+        # So we try both: root pointing to images/ and root pointing to the split directory
         print(f"Loading COCO Caption 2017 {split} split using torchvision...")
         print(f"  Image root: {coco_root}")
         print(f"  Annotation file: {coco_ann_file}")
         print(f"  Split directory: {split_dir}")
-        self.dataset = dset.CocoCaptions(
-            root=coco_root,  # Points to images/ directory, not images/train2017/
-            annFile=coco_ann_file,
-            transform=None,  # We'll handle transforms in _process_sample
-        )
+
+        # Try with root pointing to images/ directory first (standard COCO format)
+        try:
+            self.dataset = dset.CocoCaptions(
+                root=coco_root,  # Points to images/ directory
+                annFile=coco_ann_file,
+                transform=None,
+            )
+            # Test if we can actually load an image
+            if len(self.dataset) > 0:
+                try:
+                    _ = self.dataset[0]
+                except Exception as e:
+                    print(f"  Warning: Failed to load image with root={coco_root}: {e}")
+                    print("  Trying with root pointing to split directory...")
+                    # Fallback: try with root pointing to split directory
+                    self.dataset = dset.CocoCaptions(
+                        root=split_dir,  # Points to images/train2017/ directory
+                        annFile=coco_ann_file,
+                        transform=None,
+                    )
+        except Exception as e:
+            print(f"  Warning: Failed to load with root={coco_root}: {e}")
+            print("  Trying with root pointing to split directory...")
+            # Fallback: try with root pointing to split directory
+            self.dataset = dset.CocoCaptions(
+                root=split_dir,  # Points to images/train2017/ directory
+                annFile=coco_ann_file,
+                transform=None,
+            )
         print(f"✓ Loaded {len(self.dataset)} images from COCO dataset")
         print("Note: Each image may have multiple captions, so actual samples will be more")
 
@@ -313,17 +340,44 @@ class COCOCaptionDataset(Dataset):
             )
 
         # Load dataset using torchvision
-        # root should point to the images directory (not the specific split directory)
-        # because annotation files contain paths like "train2017/xxxx.jpg"
+        # For COCO, the annotation file contains paths like "train2017/xxxx.jpg"
+        # If root points to images/, torchvision will look for images/train2017/xxxx.jpg
+        # However, some annotation files might have paths without the split prefix
+        # So we try both: root pointing to images/ and root pointing to the split directory
         print(f"Loading COCO Caption 2017 {split} split using torchvision...")
         print(f"  Image root: {coco_root}")
         print(f"  Annotation file: {coco_ann_file}")
         print(f"  Split directory: {split_dir}")
-        self.coco_dataset = dset.CocoCaptions(
-            root=coco_root,  # Points to images/ directory, not images/train2017/
-            annFile=coco_ann_file,
-            transform=None,  # We'll handle transforms in _process_sample
-        )
+
+        # Try with root pointing to images/ directory first (standard COCO format)
+        try:
+            self.coco_dataset = dset.CocoCaptions(
+                root=coco_root,  # Points to images/ directory
+                annFile=coco_ann_file,
+                transform=None,
+            )
+            # Test if we can actually load an image
+            if len(self.coco_dataset) > 0:
+                try:
+                    _ = self.coco_dataset[0]
+                except Exception as e:
+                    print(f"  Warning: Failed to load image with root={coco_root}: {e}")
+                    print("  Trying with root pointing to split directory...")
+                    # Fallback: try with root pointing to split directory
+                    self.coco_dataset = dset.CocoCaptions(
+                        root=split_dir,  # Points to images/train2017/ directory
+                        annFile=coco_ann_file,
+                        transform=None,
+                    )
+        except Exception as e:
+            print(f"  Warning: Failed to load with root={coco_root}: {e}")
+            print("  Trying with root pointing to split directory...")
+            # Fallback: try with root pointing to split directory
+            self.coco_dataset = dset.CocoCaptions(
+                root=split_dir,  # Points to images/train2017/ directory
+                annFile=coco_ann_file,
+                transform=None,
+            )
         print(f"✓ Loaded {len(self.coco_dataset)} images from COCO dataset")
 
         # Build index mapping: (image_idx, caption_idx) -> sample_idx
