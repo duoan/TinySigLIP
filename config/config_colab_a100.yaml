@@ -9,9 +9,9 @@ defaults:
 # Effective batch size = batch_size × 1 GPU
 training:
   batch_size: 256  # Per GPU batch size (A100 40GB can handle large batches)
-  max_steps: 10000  # More steps for single GPU training
+  num_epochs: 3  # More epochs for single GPU training
   learning_rate: 3.0e-4  # Scaled for larger batch size (sqrt scaling: 5e-5 × sqrt(256/16) ≈ 2e-4, use 3e-4)
-  warmup_steps: 500  # ~5% of max_steps
+  warmup_epochs: 0.15  # ~5% of training
 
 # Dataset configuration overrides
 dataset:

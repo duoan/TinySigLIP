@@ -9,9 +9,9 @@ defaults:
 # Training configuration overrides for L4 (24GB VRAM)
 training:
   batch_size: 64  # Per GPU batch size (L4 has 24GB, can handle larger batches)
-  max_steps: 5000  # Reasonable number of steps for Colab
+  num_epochs: 2  # Reasonable number of epochs for Colab
   learning_rate: 5.0e-5  # Standard learning rate for single GPU
-  warmup_steps: 200  # ~4% of max_steps
+  warmup_epochs: 0.08  # ~4% of training
 
 # Dataset configuration overrides
 dataset:

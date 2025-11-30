@@ -20,7 +20,7 @@ training:
   batch_size: 16
   image_size: 224
   text_seq_len: 64
-  num_epochs: 10  # Number of training epochs
+  num_epochs: 1  # Number of training epochs
   learning_rate: 5.0e-5
   warmup_epochs: 1  # Number of warmup epochs (will be converted to steps based on dataset size)
   use_cosine_scheduler: true
@@ -36,7 +36,7 @@ loss:
 dataset:
   use_real_data: true
   split: "val"  # 'val' or 'test' or 'train' - use 'val' for local development/testing
-  cache_dir: null
+  cache_dir: "data/coco/cache"
   use_augmentation: true
   streaming: false  # Use non-streaming mode (required for epoch-based training)
   num_workers: 4  # Number of data loading workers (can be >0 for non-streaming Dataset)
