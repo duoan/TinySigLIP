@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import shutil
 import zipfile
 from pathlib import Path
 from urllib.request import urlretrieve
@@ -121,7 +122,7 @@ def download_file(url: str, filepath: Path, desc: str = "Downloading", expected_
         return False
 
 
-def extract_zip(zip_path: Path, extract_to: Path, desc: str = "Extracting"):
+def extract_zip(zip_path: Path, extract_to: Path, desc: str = "Extracting", strip_prefix: str | None = None):
     """
     Extract a zip file.
 
@@ -129,6 +130,8 @@ def extract_zip(zip_path: Path, extract_to: Path, desc: str = "Extracting"):
         zip_path: Path to zip file
         extract_to: Directory to extract to
         desc: Description for extraction
+        strip_prefix: If provided, strip this prefix from all paths in the zip
+                     (e.g., "annotations/" to avoid nested directories)
     """
     print(f"{desc} {zip_path.name}...")
     extract_to.mkdir(parents=True, exist_ok=True)
@@ -139,8 +142,37 @@ def extract_zip(zip_path: Path, extract_to: Path, desc: str = "Extracting"):
             file_list = zip_ref.namelist()
             total_files = len(file_list)
 
+            # Check if we need to strip a prefix
+            if strip_prefix is None:
+                # Auto-detect if all files have a common prefix (like "annotations/")
+                if file_list:
+                    first_path = file_list[0]
+                    if "/" in first_path:
+                        common_prefix = first_path.split("/")[0] + "/"
+                        # Check if all files start with this prefix
+                        if all(f.startswith(common_prefix) for f in file_list if f):
+                            strip_prefix = common_prefix
+
             for idx, member in enumerate(file_list):
-                zip_ref.extract(member, extract_to)
+                # Skip directories
+                if member.endswith("/"):
+                    continue
+
+                # Strip prefix if needed
+                if strip_prefix and member.startswith(strip_prefix):
+                    member_path = member[len(strip_prefix) :]
+                else:
+                    member_path = member
+
+                # Extract to target location
+                target_path = extract_to / member_path
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+
+                # Extract file
+                with zip_ref.open(member) as source:
+                    with open(target_path, "wb") as target:
+                        target.write(source.read())
+
                 if (idx + 1) % 100 == 0 or (idx + 1) == total_files:
                     percent = int((idx + 1) / total_files * 100)
                     print(f"\r{desc}: {percent}% ({idx + 1}/{total_files} files)", end="", flush=True)
@@ -255,8 +287,8 @@ def download_coco_annotations(data_dir: Path):
     print(f"{'=' * 60}")
 
     if download_file(url, zip_path, desc="Downloading annotations", expected_size=expected_size):
-        # Extract annotations
-        extract_zip(zip_path, annotations_dir, desc="Extracting annotations")
+        # Extract annotations (strip "annotations/" prefix if present in zip)
+        extract_zip(zip_path, annotations_dir, desc="Extracting annotations", strip_prefix="annotations/")
         # Verify extraction
         expected_files = ["captions_train2017.json", "captions_val2017.json"]
         all_exist = all((annotations_dir / f).exists() for f in expected_files)
@@ -264,6 +296,18 @@ def download_coco_annotations(data_dir: Path):
             print("✓ Annotations extracted successfully")
         else:
             print("⚠ Warning: Some annotation files may be missing")
+            # Check if files are in nested directory
+            nested_annotations = annotations_dir / "annotations"
+            if nested_annotations.exists() and nested_annotations.is_dir():
+                print("⚠ Found nested annotations directory. Moving files...")
+                for file in nested_annotations.glob("*.json"):
+                    shutil.move(str(file), str(annotations_dir / file.name))
+                # Remove empty nested directory
+                try:
+                    nested_annotations.rmdir()
+                    print("✓ Fixed nested directory structure")
+                except OSError:
+                    pass
 
         # Optionally remove zip file to save space
         # zip_path.unlink()
