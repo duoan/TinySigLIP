@@ -547,7 +547,6 @@ def main(cfg: DictConfig) -> None:
             streaming=cfg.dataset.streaming,
         )
         # For IterableDataset, shuffle is handled differently (use buffer_size)
-        # num_workers=0 for IterableDataset to avoid issues with streaming
         # Use DistributedSampler if using distributed training
         sampler = None
         if use_distributed:
@@ -557,13 +556,29 @@ def main(cfg: DictConfig) -> None:
             if not cfg.dataset.streaming:
                 sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False)
 
+        # For streaming IterableDataset, num_workers is limited by dataset shards
+        # HuggingFace streaming datasets automatically shard, and num_workers cannot exceed num_shards
+        # In distributed training, each process gets one shard, so num_workers should be <= 1
+        # For non-streaming or when we have more control, we can use more workers
+        if cfg.dataset.streaming:
+            # For streaming: limit num_workers to 1 per process to avoid shard conflicts
+            # Each distributed process will get its own shard automatically
+            effective_num_workers = min(DATASET_NUM_WORKERS, 1) if use_distributed else DATASET_NUM_WORKERS
+            if is_main_process(rank) and DATASET_NUM_WORKERS > effective_num_workers:
+                print(
+                    f"Warning: num_workers={DATASET_NUM_WORKERS} reduced to {effective_num_workers} "
+                    f"for streaming IterableDataset in distributed training"
+                )
+        else:
+            effective_num_workers = DATASET_NUM_WORKERS
+
         dataloader = DataLoader(
             dataset,
             batch_size=BATCH_SIZE,
             shuffle=False if (use_distributed or cfg.dataset.streaming) else True,
             sampler=sampler,
             collate_fn=collate_coco_batch,
-            num_workers=DATASET_NUM_WORKERS,
+            num_workers=effective_num_workers,
             pin_memory=True if (torch.cuda.is_available() and device.type == "cuda") else False,
         )
         # Note: IterableDataset doesn't support len()
