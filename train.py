@@ -32,7 +32,7 @@ except ImportError:
     WANDB_AVAILABLE = False
     print("Warning: wandb not installed. Install with: pip install wandb")
 
-from tinysiglip.coco_dataset import COCOCaptionDataset, collate_coco_batch
+from tinysiglip.coco_dataset import COCOCaptionDatasetFactory, collate_coco_batch
 from tinysiglip.embedding_distillation import (
     create_dummy_token_mapping,
     create_token_mapping,
@@ -152,6 +152,30 @@ def main(cfg: DictConfig) -> None:
     DATASET_CACHE_DIR = cfg.dataset.cache_dir
     USE_AUGMENTATION = cfg.dataset.use_augmentation
     DATASET_NUM_WORKERS = cfg.dataset.get("num_workers", 0)
+
+    # Handle COCO paths - convert relative paths to absolute
+    coco_root_raw = cfg.dataset.get("coco_root", None)
+    coco_ann_file_raw = cfg.dataset.get("coco_ann_file", None)
+
+    if coco_root_raw is not None:
+        # Convert relative path to absolute path (relative to project root)
+        if not os.path.isabs(coco_root_raw):
+            project_root = Path(__file__).parent.resolve()
+            COCO_ROOT = str(project_root / coco_root_raw)
+        else:
+            COCO_ROOT = coco_root_raw
+    else:
+        COCO_ROOT = None
+
+    if coco_ann_file_raw is not None:
+        # Convert relative path to absolute path (relative to project root)
+        if not os.path.isabs(coco_ann_file_raw):
+            project_root = Path(__file__).parent.resolve()
+            COCO_ANN_FILE = str(project_root / coco_ann_file_raw)
+        else:
+            COCO_ANN_FILE = coco_ann_file_raw
+    else:
+        COCO_ANN_FILE = None
 
     STUDENT_VOCAB_SIZE = cfg.student.vocab_size
     STUDENT_TOKENIZER_NAME = cfg.student.tokenizer_name
@@ -536,7 +560,7 @@ def main(cfg: DictConfig) -> None:
             student_processor.image_processor.use_augmentation = use_augmentation_for_split
             student_processor.image_processor._build_transform()
 
-        dataset = COCOCaptionDataset(
+        dataset = COCOCaptionDatasetFactory(
             split=DATASET_SPLIT,
             image_size=IMAGE_SIZE,
             student_processor=student_processor,
@@ -545,6 +569,8 @@ def main(cfg: DictConfig) -> None:
             cache_dir=DATASET_CACHE_DIR,
             use_augmentation=use_augmentation_for_split,
             streaming=cfg.dataset.streaming,
+            coco_root=COCO_ROOT,
+            coco_ann_file=COCO_ANN_FILE,
         )
         # For IterableDataset, shuffle is handled differently (use buffer_size)
         # Use DistributedSampler if using distributed training

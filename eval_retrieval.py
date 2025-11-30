@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from tinysiglip.coco_dataset import COCOCaptionDataset, collate_coco_batch
+from tinysiglip.coco_dataset import COCOCaptionDatasetFactory, collate_coco_batch
 from tinysiglip.model import TinySiglipModel
 from tinysiglip.processor import TinySiglipProcessor
 
@@ -109,6 +109,8 @@ def evaluate_retrieval_coco(
     cache_dir: str | None = None,
     k_values=(1, 5, 10),
     max_samples: int | None = None,
+    coco_root: str | None = None,
+    coco_ann_file: str | None = None,
 ):
     """
     Evaluate image-text retrieval on COCO validation set.
@@ -137,7 +139,7 @@ def evaluate_retrieval_coco(
         else 224
     )
     max_seq_len = processor.max_seq_len if hasattr(processor, "max_seq_len") else 64
-    dataset = COCOCaptionDataset(
+    dataset = COCOCaptionDatasetFactory(
         split=split,
         image_size=image_size,
         student_processor=processor,
@@ -146,6 +148,8 @@ def evaluate_retrieval_coco(
         cache_dir=cache_dir,
         use_augmentation=False,  # No augmentation for evaluation
         streaming=False,  # Need full dataset for proper evaluation
+        coco_root=coco_root,
+        coco_ann_file=coco_ann_file,
     )
 
     # Create dataloader
@@ -360,6 +364,18 @@ def main():
         default=None,
         help="Maximum number of samples to evaluate (default: None for all)",
     )
+    parser.add_argument(
+        "--coco-root",
+        type=str,
+        default=None,
+        help="Root directory where COCO images are stored",
+    )
+    parser.add_argument(
+        "--coco-ann-file",
+        type=str,
+        default=None,
+        help="Path to COCO annotation JSON file",
+    )
 
     args = parser.parse_args()
 
@@ -408,6 +424,8 @@ def main():
         logit_scale=logit_scale,
         cache_dir=args.cache_dir,
         max_samples=args.max_samples,
+        coco_root=args.coco_root,
+        coco_ann_file=args.coco_ann_file,
     )
 
     if results:

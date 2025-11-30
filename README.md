@@ -51,6 +51,94 @@ uv sync
 pip install -r requirements.txt
 ```
 
+### Dataset Preparation
+
+**COCO 2017 Caption Dataset**
+
+For training, you need to download the COCO 2017 Caption dataset. We provide convenient download scripts:
+
+**Option 1: Using Bash Script (Recommended - with defaults)**
+
+The easiest way is to use the bash script with default parameters. **By default, it downloads all splits (train, val, test) and annotations**:
+
+```bash
+# Download with all defaults (downloads ALL splits: train, val, test to ./data/coco)
+./download_coco.sh
+
+# Download only specific splits (for quick testing or limited storage)
+./download_coco.sh --split val
+./download_coco.sh --split train val  # Skip test split
+
+# Download to custom directory
+./download_coco.sh --data-dir /path/to/coco
+
+# Download only annotations (if images are already downloaded)
+./download_coco.sh --annotations-only
+
+# Download and cleanup zip files to save space
+./download_coco.sh --cleanup
+```
+
+**Option 2: Using Python Script Directly**
+
+You can also use the Python script directly:
+
+```bash
+# Download all splits (train, val, test) and annotations (default behavior)
+python download_coco.py --data-dir ./data/coco
+
+# Download only specific splits (for quick testing or limited storage)
+python download_coco.py --data-dir ./data/coco --split val
+python download_coco.py --data-dir ./data/coco --split train val  # Skip test split
+
+# Download only annotations (if images are already downloaded)
+python download_coco.py --data-dir ./data/coco --annotations-only
+
+# Download specific splits
+python download_coco.py --data-dir ./data/coco --split train val
+
+# Clean up zip files after extraction to save space
+python download_coco.py --data-dir ./data/coco --cleanup
+```
+
+The script will:
+- Download all splits by default: training images (~19GB), validation images (~1GB), test images (~6GB), and annotations (~241MB)
+- Total size: ~26GB (all splits) or ~20GB (train + val only)
+- Extract files to organized directories
+- Show download progress with progress bars
+- **Zero configuration needed** - just run `./download_coco.sh` and start training!
+
+**Directory Structure After Download:**
+
+```
+./data/coco/
+├── images/
+│   ├── train2017/    # Training images (~118K images, ~19GB)
+│   ├── val2017/      # Validation images (~5K images, ~1GB)
+│   └── test2017/      # Test images (~40K images, ~6GB)
+├── annotations/
+│   ├── captions_train2017.json
+│   └── captions_val2017.json
+└── downloads/        # Zip files (can be removed with --cleanup)
+```
+
+**Configuration:**
+
+✅ **No configuration needed!** The default configuration in `config/config.yaml` is already set up:
+
+```yaml
+dataset:
+  coco_root: "data/coco/images"  # Relative to project root
+  coco_ann_file: "data/coco/annotations/captions_train2017.json"
+  split: "train"  # or "val" or "test"
+```
+
+If you use the default download location (`./data/coco`), **just run `./download_coco.sh` and start training** - everything is pre-configured!
+
+The paths are relative to the project root and will be automatically resolved. If you downloaded to a custom location, you can update the paths in `config/config.yaml` using either:
+- **Relative paths** (relative to project root): `"data/coco/images"`
+- **Absolute paths**: `"/path/to/coco/images"`
+
 ### Quick Start
 
 **1. Training**
@@ -139,16 +227,29 @@ The evaluation script will:
 
 **Note**: The checkpoint directory should contain a `processor/` subdirectory (saved automatically during training) for proper text tokenization. If not available, the script will attempt to create a processor from the checkpoint configuration.
 
-**3. Image-Text Retrieval Evaluation**
+**3. Image-Text Retrieval Evaluation (COCO)**
 
-Evaluate image-text retrieval performance:
+Evaluate image-text retrieval performance on COCO dataset:
 
 ```bash
 python eval_retrieval.py \
-    --checkpoint /path/to/checkpoint.pt \
-    --image-dir /path/to/images \
-    --text-file /path/to/captions.txt
+    --resume /path/to/checkpoint.pt \
+    --split val \
+    --coco-root /path/to/coco/images \
+    --coco-ann-file /path/to/coco/annotations/captions_val2017.json \
+    --batch-size 32 \
+    --num-workers 4
 ```
+
+**Arguments:**
+- `--resume`: Path to checkpoint file (`.pt` file saved during training)
+- `--split`: Dataset split to evaluate on (`val` or `test`, default: `val`)
+- `--coco-root`: Root directory where COCO images are stored
+- `--coco-ann-file`: Path to COCO annotation JSON file
+- `--batch-size`: Batch size for evaluation (default: 32)
+- `--num-workers`: Number of data loading workers (default: 4)
+- `--device`: Device to use (default: `cuda`)
+- `--max-samples`: Maximum number of samples to evaluate (default: None for all)
 
 ## Model Architecture
 

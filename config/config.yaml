@@ -35,11 +35,13 @@ loss:
 # Dataset configuration
 dataset:
   use_real_data: true
-  split: "val"  # 'val' or 'test'
+  split: "train"  # 'val' or 'test' or 'train'
   cache_dir: null
   use_augmentation: true
   streaming: true
   num_workers: 0  # Number of data loading workers (0 for streaming IterableDataset, can be >0 for regular Dataset)
+  coco_root: "data/coco/images"  # Root directory where COCO images are stored (default: relative to project root)
+  coco_ann_file: "data/coco/annotations/captions_train2017.json"  # Path to COCO annotation JSON file (default: relative to project root)
 
 # Embedding configuration
 embedding:
