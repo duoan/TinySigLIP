@@ -17,3 +17,7 @@ training:
 # Dataset configuration overrides
 dataset:
   split: "train"  # Use 'train' for actual training on remote server
+
+# Early stopping configuration overrides for remote training
+early_stopping:
+  patience: 100  # More patience for remote training (100 steps)

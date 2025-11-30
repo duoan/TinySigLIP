@@ -168,6 +168,14 @@ def main(cfg: DictConfig) -> None:
     log_every_n_steps = cfg.logging.log_every_n_steps
     eval_every_n_steps = cfg.logging.get("eval_every_n_steps", log_every_n_steps)
 
+    # Early stopping configuration
+    early_stopping_enabled = cfg.early_stopping.get("enabled", False)
+    early_stopping_patience = cfg.early_stopping.get("patience", 500)
+    early_stopping_min_delta = cfg.early_stopping.get("min_delta", 0.001)
+    early_stopping_monitor = cfg.early_stopping.get("monitor", "weighted")
+    early_stopping_mode = cfg.early_stopping.get("mode", "min")
+    restore_best_weights = cfg.early_stopping.get("restore_best_weights", True)
+
     # Initialize WandB (only on main process)
     wandb_enabled = cfg.wandb.get("enabled", False) and WANDB_AVAILABLE and is_main_process(rank)
     if wandb_enabled:
@@ -597,6 +605,24 @@ def main(cfg: DictConfig) -> None:
         print(f"\nStarting training for {MAX_STEPS} steps...")
         print("Note: If dataset ends before max_steps, it will cycle back and continue.")
 
+    # Initialize early stopping
+    best_monitor_value = None
+    best_step = 0
+    patience_counter = 0
+    best_model_state = None
+    best_projection_v_state = None
+    best_projection_t_state = None
+    best_logit_scale = None
+
+    if early_stopping_enabled and is_main_process(rank):
+        print("\n=== Early Stopping Enabled ===")
+        print(f"Monitor: {early_stopping_monitor}")
+        print(f"Mode: {early_stopping_mode}")
+        print(f"Patience: {early_stopping_patience} steps")
+        print(f"Min delta: {early_stopping_min_delta}")
+        print(f"Restore best weights: {restore_best_weights}")
+        print("=" * 30 + "\n")
+
     # Create an iterator that can cycle through the dataloader
     step = 0
     dataloader_iter = iter(dataloader)
@@ -705,6 +731,53 @@ def main(cfg: DictConfig) -> None:
                     teacher_text_raw=teacher_text_raw,
                 )
 
+        # Early stopping check (check every step, but only save best model periodically)
+        should_stop = False
+        if early_stopping_enabled:
+            # Get the monitored value from loss_dict or eval_metrics
+            if early_stopping_monitor in loss_dict:
+                monitor_value = loss_dict[early_stopping_monitor]
+            elif early_stopping_monitor in eval_metrics:
+                monitor_value = eval_metrics[early_stopping_monitor]
+            else:
+                # Default to weighted loss if monitor key not found
+                monitor_value = loss_dict.get("weighted", float("inf"))
+                if is_main_process(rank) and step == 1:
+                    print(f"Warning: Monitor key '{early_stopping_monitor}' not found, using 'weighted' loss instead")
+
+            # Check if this is a better value
+            is_better = False
+            if best_monitor_value is None:
+                is_better = True
+            elif early_stopping_mode == "min":
+                is_better = monitor_value < (best_monitor_value - early_stopping_min_delta)
+            else:  # mode == "max"
+                is_better = monitor_value > (best_monitor_value + early_stopping_min_delta)
+
+            if is_better:
+                best_monitor_value = monitor_value
+                best_step = step
+                patience_counter = 0
+                # Save best model state (only on main process)
+                if is_main_process(rank):
+                    best_model_state = model_to_train.state_dict().copy()
+                    best_projection_v_state = projection_v.state_dict().copy()
+                    best_projection_t_state = projection_t.state_dict().copy()
+                    best_logit_scale = logit_scale.data.clone()
+                    if step % log_every_n_steps == 0:
+                        print(f"✓ New best {early_stopping_monitor}: {monitor_value:.6f} (step {step})")
+            else:
+                patience_counter += 1
+                if patience_counter >= early_stopping_patience:
+                    should_stop = True
+                    if is_main_process(rank):
+                        print(f"\n{'=' * 70}")
+                        print("Early stopping triggered!")
+                        print(f"  Best {early_stopping_monitor}: {best_monitor_value:.6f} at step {best_step}")
+                        print(f"  Current {early_stopping_monitor}: {monitor_value:.6f} at step {step}")
+                        print(f"  No improvement for {patience_counter} steps (patience: {early_stopping_patience})")
+                        print(f"{'=' * 70}\n")
+
         # Logging
         current_lr = optimizer.param_groups[0]["lr"]
         log_dict = {**loss_dict, **eval_metrics, "step": step, "total": MAX_STEPS, "lr": f"{current_lr:.2e}"}
@@ -738,11 +811,39 @@ def main(cfg: DictConfig) -> None:
                     log_message += f"\n  Retrieval: {retrieval_metrics}"
                 if similarity_metrics:
                     log_message += f"\n  Similarity: {similarity_metrics}"
+            if early_stopping_enabled:
+                log_message += (
+                    f" | Best {early_stopping_monitor}: {best_monitor_value:.6f} (step {best_step}) "
+                    f"| Patience: {patience_counter}/{early_stopping_patience}"
+                )
             print(log_message)
 
+        # Check early stopping
+        if should_stop:
+            break
+
     pbar.close()
+
+    # Restore best weights if early stopping was enabled and triggered
+    if early_stopping_enabled and should_stop and restore_best_weights and is_main_process(rank):
+        if (
+            best_model_state is not None
+            and best_projection_v_state is not None
+            and best_projection_t_state is not None
+            and best_logit_scale is not None
+        ):
+            print(f"\nRestoring best model weights from step {best_step}...")
+            model_to_train.load_state_dict(best_model_state)
+            projection_v.load_state_dict(best_projection_v_state)
+            projection_t.load_state_dict(best_projection_t_state)
+            logit_scale.data = best_logit_scale
+            print(f"✓ Best weights restored (best {early_stopping_monitor}: {best_monitor_value:.6f})")
+
     if is_main_process(rank):
-        print(f"\nTraining completed after {step} steps!")
+        if should_stop:
+            print(f"\nTraining stopped early after {step} steps (best at step {best_step})!")
+        else:
+            print(f"\nTraining completed after {step} steps!")
 
     # Log final metrics to WandB
     if wandb_enabled:
@@ -753,14 +854,40 @@ def main(cfg: DictConfig) -> None:
     if is_main_process(rank):
         print(f"Saving model to {checkpoint_path}...")
         # Get state dict from DDP model if needed
-        model_state_dict = model_to_train.state_dict()
+        # Use best model state if early stopping was enabled and best weights were restored
+        if (
+            early_stopping_enabled
+            and restore_best_weights
+            and best_model_state is not None
+            and best_projection_v_state is not None
+            and best_projection_t_state is not None
+            and best_logit_scale is not None
+        ):
+            model_state_dict = best_model_state
+            projection_v_state = best_projection_v_state
+            projection_t_state = best_projection_t_state
+            logit_scale_data = best_logit_scale
+            print(
+                f"  Saving best model from step {best_step} (best {early_stopping_monitor}: {best_monitor_value:.6f})"
+            )
+        else:
+            model_state_dict = model_to_train.state_dict()
+            projection_v_state = projection_v.state_dict()
+            projection_t_state = projection_t.state_dict()
+            logit_scale_data = logit_scale.data
+
         checkpoint_dict = {
             "student_model": model_state_dict,
-            "projection_v": projection_v.state_dict(),
-            "projection_t": projection_t.state_dict(),
-            "logit_scale": logit_scale.data,
+            "projection_v": projection_v_state,
+            "projection_t": projection_t_state,
+            "logit_scale": logit_scale_data,
             "config": OmegaConf.to_container(cfg, resolve=True),
         }
+        if early_stopping_enabled:
+            checkpoint_dict["best_step"] = best_step
+            checkpoint_dict["best_monitor_value"] = best_monitor_value
+            checkpoint_dict["best_monitor_key"] = early_stopping_monitor
+
         torch.save(checkpoint_dict, checkpoint_path)
         print(f"Model saved to {checkpoint_path}")
 

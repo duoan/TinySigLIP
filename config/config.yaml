@@ -55,6 +55,15 @@ logging:
   log_every_n_steps: 100
   eval_every_n_steps: 100  # Compute evaluation metrics every N steps
 
+# Early stopping configuration
+early_stopping:
+  enabled: true  # Enable early stopping
+  patience: 10  # Number of steps to wait before stopping if no improvement (local: 10, remote: 100)
+  min_delta: 0.001  # Minimum change to qualify as an improvement
+  monitor: "weighted"  # Metric to monitor: "weighted" (total loss), "siglip", "cmd", "umd"
+  mode: "min"  # "min" for loss (lower is better), "max" for metrics (higher is better)
+  restore_best_weights: true  # Restore best model weights when stopping early
+
 # WandB configuration
 wandb:
   enabled: true
