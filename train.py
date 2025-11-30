@@ -563,6 +563,12 @@ def main(cfg: DictConfig) -> None:
                     teacher_image_features=teacher_image_features,
                     teacher_text_features=teacher_text_features,
                     logit_scale=logit_scale,
+                    projection_v=projection_v,
+                    projection_t=projection_t,
+                    student_vision_raw=student_vision_raw,
+                    student_text_raw=student_text_raw,
+                    teacher_vision_raw=teacher_vision_raw,
+                    teacher_text_raw=teacher_text_raw,
                 )
 
         # Logging

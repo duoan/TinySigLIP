@@ -82,8 +82,8 @@ def compute_feature_similarity(student_features, teacher_features, prefix=""):
     Compute cosine similarity between student and teacher features.
 
     Args:
-        student_features: (B, D) student features
-        teacher_features: (B, D) teacher features
+        student_features: (B, D_s) student features
+        teacher_features: (B, D_t) teacher features
         prefix: prefix for metric names
 
     Returns:
@@ -93,8 +93,21 @@ def compute_feature_similarity(student_features, teacher_features, prefix=""):
     student_features = F.normalize(student_features, dim=-1)
     teacher_features = F.normalize(teacher_features, dim=-1)
 
-    # Compute pairwise cosine similarities
-    similarities = (student_features * teacher_features).sum(dim=-1)  # (B,)
+    # Handle dimension mismatch
+    student_dim = student_features.shape[-1]
+    teacher_dim = teacher_features.shape[-1]
+
+    if student_dim == teacher_dim:
+        # Same dimension: direct cosine similarity
+        similarities = (student_features * teacher_features).sum(dim=-1)  # (B,)
+    elif student_dim < teacher_dim:
+        # Student has smaller dimension: compare with first D_s dimensions of teacher
+        teacher_features_subset = teacher_features[:, :student_dim]
+        similarities = (student_features * teacher_features_subset).sum(dim=-1)  # (B,)
+    else:
+        # Teacher has smaller dimension: compare with first D_t dimensions of student
+        student_features_subset = student_features[:, :teacher_dim]
+        similarities = (student_features_subset * teacher_features).sum(dim=-1)  # (B,)
 
     metrics = {
         f"{prefix}mean_sim": similarities.mean().item(),
@@ -111,16 +124,28 @@ def compute_evaluation_metrics(
     teacher_image_features,
     teacher_text_features,
     logit_scale,
+    projection_v=None,
+    projection_t=None,
+    student_vision_raw=None,
+    student_text_raw=None,
+    teacher_vision_raw=None,
+    teacher_text_raw=None,
 ):
     """
     Compute comprehensive evaluation metrics during training.
 
     Args:
-        student_image_features: (B, D) student image features
-        student_text_features: (B, D) student text features
-        teacher_image_features: (B, D) teacher image features
-        teacher_text_features: (B, D) teacher text features
+        student_image_features: (B, D_s) student image features (projected)
+        student_text_features: (B, D_s) student text features (projected)
+        teacher_image_features: (B, D_t) teacher image features (projected)
+        teacher_text_features: (B, D_t) teacher text features (projected)
         logit_scale: scalar temperature scale
+        projection_v: Optional projection layer for vision features
+        projection_t: Optional projection layer for text features
+        student_vision_raw: Optional raw student vision features (before projection)
+        student_text_raw: Optional raw student text features (before projection)
+        teacher_vision_raw: Optional raw teacher vision features (before projection)
+        teacher_text_raw: Optional raw teacher text features (before projection)
 
     Returns:
         dict: comprehensive metrics dictionary
@@ -140,14 +165,43 @@ def compute_evaluation_metrics(
     metrics.update(teacher_metrics)
 
     # 3. Feature similarity (student vs teacher)
-    image_sim = compute_feature_similarity(
-        student_image_features, teacher_image_features, prefix="image_sim_"
-    )
+    # Use raw features with projections if available for more accurate comparison
+    if (
+        projection_v is not None
+        and student_vision_raw is not None
+        and teacher_vision_raw is not None
+    ):
+        # Project student raw features to teacher dimension
+        student_vision_proj = projection_v(student_vision_raw)
+        student_vision_proj_norm = F.normalize(student_vision_proj, dim=-1)
+        teacher_vision_raw_norm = F.normalize(teacher_vision_raw, dim=-1)
+        image_sim = compute_feature_similarity(
+            student_vision_proj_norm, teacher_vision_raw_norm, prefix="image_sim_"
+        )
+    else:
+        # Fallback to projected features comparison
+        image_sim = compute_feature_similarity(
+            student_image_features, teacher_image_features, prefix="image_sim_"
+        )
     metrics.update(image_sim)
 
-    text_sim = compute_feature_similarity(
-        student_text_features, teacher_text_features, prefix="text_sim_"
-    )
+    if (
+        projection_t is not None
+        and student_text_raw is not None
+        and teacher_text_raw is not None
+    ):
+        # Project student raw features to teacher dimension
+        student_text_proj = projection_t(student_text_raw)
+        student_text_proj_norm = F.normalize(student_text_proj, dim=-1)
+        teacher_text_raw_norm = F.normalize(teacher_text_raw, dim=-1)
+        text_sim = compute_feature_similarity(
+            student_text_proj_norm, teacher_text_raw_norm, prefix="text_sim_"
+        )
+    else:
+        # Fallback to projected features comparison
+        text_sim = compute_feature_similarity(
+            student_text_features, teacher_text_features, prefix="text_sim_"
+        )
     metrics.update(text_sim)
 
     # 4. Cross-modal alignment quality

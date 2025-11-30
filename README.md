@@ -1,103 +1,300 @@
 # TinySigLIP
 
-基于 TinyCLIP 方法的 SigLIP 模型蒸馏实现，使用 timm 库构建学生模型。
+A SigLIP model distillation implementation based on the TinyCLIP approach, using the `timm` library to construct the student model.
 
-## 结构
+## Overview
 
-- `tinysiglip/model.py`: 学生模型定义（使用 timm 构建视觉编码器）
-- `tinysiglip/loss.py`: 蒸馏损失函数（SigLIP loss + CMD + UMD + Embedding Mimicking）
-- `tinysiglip/embedding_distillation.py`: Token Embedding Layer 蒸馏工具
-- `tinysiglip/data.py`: 数据集定义
-- `train.py`: 训练脚本
+TinySigLIP is a knowledge distillation framework for creating compact vision-language models by distilling knowledge from large SigLIP teacher models to smaller student models. The framework supports multiple distillation strategies including cross-modal distillation (CMD), uni-modal distillation (UMD), and embedding layer knowledge transfer.
 
-## 使用方法
+## Model Architecture
+
+The student model consists of a vision encoder (from `timm`) and a lightweight text encoder:
+
+```mermaid
+graph TB
+    subgraph "Student Model"
+        I[Input Images<br/>B×3×H×W] --> VE[Vision Encoder<br/>timm backbone]
+        T[Input Text IDs<br/>B×seq_len] --> TE[Text Embedding<br/>vocab_size×dim]
+        TE --> TP[Positional Embedding]
+        TP --> TT[Text Transformer<br/>L layers]
+        VE --> VP[Vision Projection<br/>Linear]
+        TT --> TP2[Text Projection<br/>Linear]
+        VP --> NF1[L2 Normalize]
+        TP2 --> NF2[L2 Normalize]
+        NF1 --> SIM[Similarity Matrix<br/>B×B]
+        NF2 --> SIM
+    end
+
+    style I fill:#e1f5ff
+    style T fill:#e1f5ff
+    style VE fill:#fff4e1
+    style TE fill:#fff4e1
+    style SIM fill:#ffe1f5
+```
+
+## Training Approach
+
+The distillation process uses multiple loss components to transfer knowledge from teacher to student:
+
+```mermaid
+graph LR
+    subgraph "Teacher Model"
+        TI[Teacher Images] --> TF[Teacher Features]
+        TT[Teacher Text] --> TF
+    end
+
+    subgraph "Student Model"
+        SI[Student Images] --> SF[Student Features]
+        ST[Student Text] --> SF
+    end
+
+    TF --> L1[SigLIP Loss<br/>Binary Cross-Entropy]
+    SF --> L1
+
+    TF --> L2[CMD Loss<br/>KL Divergence]
+    SF --> L2
+
+    TF --> L3[UMD Loss<br/>MSE on Features]
+    SF --> L3
+
+    L1 --> TL[Total Loss]
+    L2 --> TL
+    L3 --> TL
+
+    TL --> OPT[Optimizer]
+
+    style TF fill:#ffe1f5
+    style SF fill:#e1f5ff
+    style TL fill:#fff4e1
+```
+
+### Loss Components
+
+1. **SigLIP Loss** ($\mathcal{L}_{SigLIP}$): Binary cross-entropy with sigmoid activation for contrastive learning
+   $$\mathcal{L}_{SigLIP} = \frac{1}{2}\left[\text{BCE}(\sigma(\mathbf{S}_{I2T}), \mathbf{Y}) + \text{BCE}(\sigma(\mathbf{S}_{T2I}), \mathbf{Y})\right]$$
+
+2. **Cross-Modal Distillation (CMD)** ($\mathcal{L}_{CMD}$): KL divergence between teacher and student similarity distributions
+   $$\mathcal{L}_{CMD} = \text{KL}\left(P_T(\mathbf{S}_T) \| P_S(\mathbf{S}_S)\right)$$
+
+3. **Uni-Modal Distillation (UMD)** ($\mathcal{L}_{UMD}$): MSE loss on normalized features from vision and text encoders
+   $$\mathcal{L}_{UMD} = \frac{1}{2}\left[\text{MSE}(\mathbf{f}_V^T, \mathbf{f}_V^S) + \text{MSE}(\mathbf{f}_T^T, \mathbf{f}_T^S)\right]$$
+
+4. **Total Loss**:
+   $$\mathcal{L}_{total} = \lambda_{SigLIP} \cdot \mathcal{L}_{SigLIP} + \lambda_{CMD} \cdot \mathcal{L}_{CMD} + \lambda_{UMD} \cdot \mathcal{L}_{UMD}$$
+
+## Project Structure
+
+- `tinysiglip/model.py`: Student model definition (uses `timm` for vision encoder)
+- `tinysiglip/loss.py`: Distillation loss functions (SigLIP loss + CMD + UMD + Embedding Mimicking)
+- `tinysiglip/embedding_distillation.py`: Token Embedding Layer distillation utilities
+- `tinysiglip/coco_dataset.py`: COCO dataset implementation
+- `tinysiglip/fake_dataset.py`: Dummy dataset for testing
+- `tinysiglip/processor.py`: Data preprocessing utilities
+- `tinysiglip/metrics.py`: Evaluation metrics
+- `train.py`: Training script with Hydra configuration
+
+## Usage
+
+### Training
 
 ```bash
 python train.py
 ```
 
-## 主要特点
+The training script uses Hydra for configuration management. Modify `config/config.yaml` to adjust hyperparameters.
 
-1. **使用 timm 构建学生模型**: 无需自定义模型结构，直接使用 timm 中的预训练模型
-2. **SigLIP 蒸馏**:
-   - SigLIP 损失（sigmoid-based contrastive loss）
-   - 跨模态蒸馏损失（CMD）
-   - 单模态特征蒸馏损失（UMD）
-   - **Token Embedding Layer 蒸馏**（Embedding Mimicking Loss）
-3. **词汇表优化**: 支持学生模型使用更小的英语专用词汇表（如 32K vs 256K），大幅减少参数
-4. **简化设计**: 代码结构清晰，易于理解和修改
+### Evaluation
 
-## 配置
+Evaluate your trained model on ImageNet-1k zero-shot classification:
 
-可以在 `train.py` 中修改：
-- 教师模型：`TEACHER_MODEL_NAME`
-- 学生视觉模型：`vision_model_name`（timm 模型名）
-- 学生词汇表大小：`STUDENT_VOCAB_SIZE`（默认 32000，可用于仅英语模型）
-  - 可以设置比教师模型更小的词汇表以节省参数
-  - 常见大小：32000 (English BPE), 50257 (GPT-2), 49152 (English CLIP)
-  - 设置为 `None` 则使用与教师模型相同的词汇表大小
-- 批次大小、学习率等超参数
+```bash
+python eval_imagenet1k.py \
+    --imagenet-val /path/to/imagenet/val \
+    --resume /path/to/checkpoint.pt \
+    --batch-size 32 \
+    --num-workers 4
+```
 
-## 不同词汇表大小
+**Arguments:**
+- `--imagenet-val`: Path to ImageNet validation set directory
+- `--resume`: Path to checkpoint file (`.pt` file saved during training)
+- `--batch-size`: Batch size for evaluation (default: 32)
+- `--num-workers`: Number of data loading workers (default: 4)
+- `--device`: Device to use (default: `cuda`)
+- `--logit-scale`: Optional logit scale (temperature). If not specified, uses value from checkpoint.
 
-学生模型可以使用与教师模型不同的词汇表大小，这对于创建更小的英语专用模型很有用。
+**Example:**
+```bash
+# Evaluate a trained model
+python eval_imagenet1k.py \
+    --imagenet-val ./ImageNet \
+    --resume ./outputs/2025-11-29_20-15-10/checkpoint.pt \
+    --batch-size 64
+```
 
-**注意**：在实际应用中（使用真实文本数据），你需要：
-1. 为学生模型创建/选择一个 tokenizer（如 sentencepiece, BPE）
-2. 使用不同的 tokenizer 将同一段文本转换为不同的 token IDs
-3. 学生模型使用学生 tokenizer 的 token IDs
-4. 教师模型使用教师 tokenizer 的 token IDs
+The evaluation script will:
+1. Load the checkpoint and restore model configuration
+2. Load or create the processor from checkpoint directory
+3. Generate text prompts for all 1000 ImageNet classes (e.g., "a photo of a {class_name}")
+4. Compute text features for all classes
+5. Evaluate on ImageNet validation set and report Top-1 and Top-5 accuracy
 
-当前代码使用虚拟数据，对于演示和测试，两个模型使用相同的 token ID 范围。
+**Note**: The checkpoint directory should contain a `processor/` subdirectory (saved automatically during training) for proper text tokenization. If not available, the script will attempt to create a processor from the checkpoint configuration.
 
-## Token Embedding Layer 蒸馏 / 权重继承
+## Key Features
 
-当学生模型使用比教师模型更小的词汇表时（如 32K vs 256K），有两种方法传递知识：
+1. **Timm-based Student Model**: No need for custom model architecture; directly use pre-trained models from `timm`
+2. **SigLIP Distillation**:
+   - SigLIP loss (sigmoid-based contrastive loss)
+   - Cross-modal distillation loss (CMD)
+   - Uni-modal feature distillation loss (UMD)
+   - **Token Embedding Layer Distillation** (Embedding Mimicking Loss)
+3. **Vocabulary Optimization**: Support for student models using smaller English-specific vocabularies (e.g., 32K vs 256K), significantly reducing parameters
+4. **Simplified Design**: Clear code structure, easy to understand and modify
 
-### 方法 1: 权重继承（推荐）⭐
+## Configuration
 
-**核心优势**：零运行时开销，一次初始化即可
+You can modify the following in `config/config.yaml`:
 
-- 在训练开始前，直接从教师模型的 embedding 层复制共享 token 的权重到学生模型
-- 无需在训练循环中计算额外的损失项
-- 实现最大程度的参数压缩
+- **Teacher Model**: `teacher.model_name` (default: `google/siglip-base-patch16-224`)
+- **Student Vision Model**: `student.vision_model_name` (timm model name, e.g., `vit_tiny_patch16_224`)
+- **Student Vocabulary Size**: `student.vocab_size` (default: 32000, for English-only models)
+  - Can be set smaller than teacher model to save parameters
+  - Common sizes: 32000 (English BPE), 50257 (GPT-2), 49152 (English CLIP)
+  - Set to `null` to use the same vocabulary size as teacher model
+- **Training Hyperparameters**: Batch size, learning rate, etc.
 
-**实现**：
-- 设置 `USE_WEIGHT_TRANSFER = True`（默认）
-- 权重会在模型初始化后自动转移
-- 剩余的非共享 token 随机初始化，在训练过程中学习
+## Different Vocabulary Sizes
 
-**参数节省**：使用 32K 词汇表相比 256K 可以节省约 **86M 参数**（在 embedding 层）
+The student model can use a different vocabulary size than the teacher model, which is useful for creating smaller English-specific models.
 
-### 方法 2: Embedding Mimicking Loss
+**Note**: In real applications (with actual text data), you need to:
+1. Create/select a tokenizer for the student model (e.g., sentencepiece, BPE)
+2. Use different tokenizers to convert the same text to different token IDs
+3. Student model uses student tokenizer's token IDs
+4. Teacher model uses teacher tokenizer's token IDs
 
-**核心思想**：
-- 找到学生和教师词汇表中的**共享 token**
-- 在训练过程中持续让学生模型对这些共享 token 的 embedding 模仿教师模型的 embedding
-- 通过 MSE 损失来实现：$\mathcal{L}_{Emb} = \text{MSE}(\text{Emb}_S(\text{共享Tokens}), \text{Emb}_T(\text{共享Tokens}))$
+The current code uses dummy data. For demonstration and testing, both models use the same token ID range.
 
-**实现**：
-- 设置 `USE_WEIGHT_TRANSFER = False`
-- 权重由 `LAMBDA_EMBEDDING` 控制（默认 0.0，因为推荐使用权重转移）
-- 在训练过程中持续计算损失
+## Token Embedding Layer Distillation / Weight Transfer
 
-### 使用真实 Tokenizer
+When the student model uses a smaller vocabulary than the teacher model (e.g., 32K vs 256K), there are two methods to transfer knowledge:
 
-在实际应用中，可以使用真实的 tokenizer 进行权重转移：
+### Method 1: Weight Transfer (Recommended) ⭐
+
+**Core Advantage**: Zero runtime overhead, one-time initialization
+
+- Before training starts, directly copy weights of shared tokens from teacher model's embedding layer to student model
+- No need to compute additional loss terms in the training loop
+- Achieves maximum parameter compression
+
+**Implementation**:
+- Set `USE_WEIGHT_TRANSFER = True` (default)
+- Weights are automatically transferred after model initialization
+- Remaining non-shared tokens are randomly initialized and learned during training
+
+**Parameter Savings**: Using a 32K vocabulary compared to 256K can save approximately **86M parameters** (in the embedding layer)
+
+### Method 2: Embedding Mimicking Loss
+
+**Core Idea**:
+- Find **shared tokens** in student and teacher vocabularies
+- During training, continuously make student model's embeddings for these shared tokens mimic teacher model's embeddings
+- Implemented via MSE loss: $\mathcal{L}_{Emb} = \text{MSE}(\text{Emb}_S(\text{shared tokens}), \text{Emb}_T(\text{shared tokens}))$
+
+**Implementation**:
+- Set `USE_WEIGHT_TRANSFER = False`
+- Weight controlled by `LAMBDA_EMBEDDING` (default 0.0, as weight transfer is recommended)
+- Continuously computed during training
+
+### Using Real Tokenizers
+
+In real applications, you can use actual tokenizers for weight transfer:
 
 ```python
 from tinysiglip.embedding_distillation import transfer_embedding_weights
 from transformers import AutoTokenizer
 
-# 加载 tokenizers
+# Load tokenizers
 student_tokenizer = AutoTokenizer.from_pretrained("your-student-tokenizer")
 teacher_tokenizer = AutoTokenizer.from_pretrained(TEACHER_MODEL_NAME)
 
-# 执行权重转移
+# Execute weight transfer
 transfer_embedding_weights(
     student_embedding_layer=student_model.text_embedding,
     teacher_embedding_layer=teacher_model.text_model.embeddings.token_embedding,
     student_tokenizer=student_tokenizer,
     teacher_tokenizer=teacher_tokenizer,
 )
+```
+
+## Ablation Study
+
+<!-- TODO: Fill in ablation study results -->
+
+### Experimental Setup
+
+- **Teacher Model**: [To be filled]
+- **Student Model**: [To be filled]
+- **Dataset**: [To be filled]
+- **Evaluation Metrics**: [To be filled]
+
+### Results
+
+| Configuration | SigLIP Loss | CMD Loss | UMD Loss | Embedding Transfer | Image-Text Retrieval (R@1) | Text-Image Retrieval (R@1) | Parameters |
+|--------------|-------------|----------|----------|-------------------|---------------------------|---------------------------|------------|
+| Baseline (SigLIP only) | ✓ | ✗ | ✗ | ✗ | [To be filled] | [To be filled] | [To be filled] |
+| + CMD | ✓ | ✓ | ✗ | ✗ | [To be filled] | [To be filled] | [To be filled] |
+| + UMD | ✓ | ✓ | ✓ | ✗ | [To be filled] | [To be filled] | [To be filled] |
+| + Embedding Transfer | ✓ | ✓ | ✓ | ✓ | [To be filled] | [To be filled] | [To be filled] |
+
+### Analysis
+
+[To be filled: Analysis of ablation study results, including:
+- Impact of each loss component
+- Effectiveness of embedding weight transfer vs. mimicking loss
+- Trade-offs between model size and performance
+- Comparison with other distillation methods]
+
+## References
+
+### Core Papers
+
+1. **SigLIP**: Zhai, X., Mustafa, B., Kolesnikov, A., & Beyer, L. (2023). Sigmoid Loss for Language Image Pre-Training. *arXiv preprint arXiv:2303.15343*. [arXiv:2303.15343](https://arxiv.org/abs/2303.15343)
+
+2. **TinyCLIP**: Wu, H., et al. (2023). TinyCLIP: CLIP Distillation via Affinity Mimicking and Weight Inheritance. *Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)*. [arXiv:2301.12562](https://arxiv.org/abs/2301.12562)
+
+3. **CLIP**: Radford, A., et al. (2021). Learning Transferable Visual Models From Natural Language Supervision. *International Conference on Machine Learning (ICML)*. [arXiv:2103.00020](https://arxiv.org/abs/2103.00020)
+
+### Knowledge Distillation
+
+4. **Knowledge Distillation**: Hinton, G., Vinyals, O., & Dean, J. (2015). Distilling the Knowledge in a Neural Network. *arXiv preprint arXiv:1503.02531*. [arXiv:1503.02531](https://arxiv.org/abs/1503.02531)
+
+5. **Feature Distillation**: Romero, A., et al. (2014). FitNets: Hints for Thin Deep Nets. *arXiv preprint arXiv:1412.6550*. [arXiv:1412.6550](https://arxiv.org/abs/1412.6550)
+
+### Vision-Language Models
+
+6. **ALIGN**: Jia, C., et al. (2021). Scaling Up Visual and Vision-Language Representation Learning With Noisy Text Supervision. *International Conference on Machine Learning (ICML)*. [arXiv:2102.05918](https://arxiv.org/abs/2102.05918)
+
+7. **BLIP**: Li, J., et al. (2022). BLIP: Bootstrapping Language-Image Pre-training for Unified Vision-Language Understanding and Generation. *International Conference on Machine Learning (ICML)*. [arXiv:2201.12086](https://arxiv.org/abs/2201.12086)
+
+### Model Compression
+
+8. **Model Compression Survey**: Choudhary, T., et al. (2020). A Comprehensive Survey on Model Compression and Acceleration. *Artificial Intelligence Review*, 53(7), 5113-5155. [Link](https://link.springer.com/article/10.1007/s10462-020-09838-1)
+
+## License
+
+See [LICENSE](LICENSE) file for details.
+
+## Citation
+
+If you use this code in your research, please cite:
+
+```bibtex
+@misc{tinysiglip2024,
+  title={TinySigLIP: SigLIP Model Distillation with Timm-based Student Architecture},
+  author={[Your Name]},
+  year={2024},
+  howpublished={\url{https://github.com/yourusername/TinySigLIP}}
+}
 ```
