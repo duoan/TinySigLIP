@@ -39,6 +39,7 @@ dataset:
   cache_dir: null
   use_augmentation: true
   streaming: true
+  num_workers: 0  # Number of data loading workers (0 for streaming IterableDataset, can be >0 for regular Dataset)
 
 # Embedding configuration
 embedding:

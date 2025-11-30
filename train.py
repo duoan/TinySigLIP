@@ -151,6 +151,7 @@ def main(cfg: DictConfig) -> None:
     DATASET_SPLIT = cfg.dataset.split
     DATASET_CACHE_DIR = cfg.dataset.cache_dir
     USE_AUGMENTATION = cfg.dataset.use_augmentation
+    DATASET_NUM_WORKERS = cfg.dataset.get("num_workers", 0)
 
     STUDENT_VOCAB_SIZE = cfg.student.vocab_size
     STUDENT_TOKENIZER_NAME = cfg.student.tokenizer_name
@@ -562,7 +563,7 @@ def main(cfg: DictConfig) -> None:
             shuffle=False if (use_distributed or cfg.dataset.streaming) else True,
             sampler=sampler,
             collate_fn=collate_coco_batch,
-            num_workers=0,  # Set to 0 for IterableDataset with streaming
+            num_workers=DATASET_NUM_WORKERS,
             pin_memory=True if (torch.cuda.is_available() and device.type == "cuda") else False,
         )
         # Note: IterableDataset doesn't support len()
@@ -589,6 +590,7 @@ def main(cfg: DictConfig) -> None:
             batch_size=BATCH_SIZE,
             shuffle=False if use_distributed else True,
             sampler=sampler,
+            num_workers=DATASET_NUM_WORKERS,
         )
         if is_main_process(rank):
             print(f"✓ Dummy dataset created: {len(dataset)} samples")
