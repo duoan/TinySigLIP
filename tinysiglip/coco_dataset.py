@@ -6,11 +6,11 @@ Expands multiple captions per image.
 
 import hashlib
 import os
-import pickle
 from pathlib import Path
 
 import torch
-from datasets import load_dataset
+from datasets import Dataset as HFDataset
+from datasets import concatenate_datasets, load_dataset, load_from_disk
 from PIL import Image
 from torch.utils.data import Dataset, IterableDataset
 
@@ -297,23 +297,25 @@ class COCOCaptionDataset(Dataset):
         )
         self.actual_split = split
 
-        # Generate cache file path based on configuration
-        cache_file = self._get_cache_file_path(cache_dir, split, image_size, max_seq_len, use_augmentation)
+        # Generate cache directory path based on configuration
+        cache_path = self._get_cache_dir_path(cache_dir, split, image_size, max_seq_len, use_augmentation)
 
         # Try to load from cache first
-        if cache_file and os.path.exists(cache_file):
-            print(f"Loading preprocessed dataset from cache: {cache_file}")
+        if cache_path and os.path.exists(cache_path):
+            print(f"Loading preprocessed dataset from cache: {cache_path}")
             try:
-                with open(cache_file, "rb") as f:
-                    self.samples = pickle.load(f)
-                print(f"✓ Loaded {len(self.samples)} preprocessed samples from cache")
+                self.hf_preprocessed = load_from_disk(cache_path)
+                print(f"✓ Loaded {len(self.hf_preprocessed)} preprocessed samples from cache")
                 return
             except Exception as e:
-                print(f"Warning: Failed to load cache file: {e}. Re-preprocessing...")
+                print(f"Warning: Failed to load cache: {e}. Re-preprocessing...")
 
-        # Preprocess all data and create index
+        # Preprocess data incrementally in batches and save to disk to avoid OOM
         print("Preprocessing dataset (this may take a while)...")
-        self.samples = []
+        batch_size = 1000  # Process and save in batches
+        batch_dirs = []  # Store paths to saved batch directories
+        total_samples = 0
+        temp_cache_dir = None
 
         # Get dataset length (non-streaming datasets support len())
         try:
@@ -321,12 +323,23 @@ class COCOCaptionDataset(Dataset):
         except (TypeError, AttributeError):
             dataset_len = None
 
+        # Create temporary directory for batch files if caching
+        if cache_path:
+            import shutil
+
+            temp_cache_dir = Path(cache_path).parent / f"{Path(cache_path).name}_temp"
+            if temp_cache_dir.exists():
+                shutil.rmtree(temp_cache_dir)
+            temp_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        current_batch = []
+        batch_idx = 0
         for idx, item in enumerate(self.hf_dataset):
             if idx % 1000 == 0 and idx > 0:
                 if dataset_len is not None:
-                    print(f"  Processed {idx}/{dataset_len} images...")
+                    print(f"  Processed {idx}/{dataset_len} images, {total_samples} samples...")
                 else:
-                    print(f"  Processed {idx} images...")
+                    print(f"  Processed {idx} images, {total_samples} samples...")
 
             try:
                 image = self._load_image(item)
@@ -336,7 +349,29 @@ class COCOCaptionDataset(Dataset):
                 for caption in captions:
                     try:
                         sample = self._process_sample(image, caption)
-                        self.samples.append(sample)
+                        # Convert tensors to numpy for HuggingFace Dataset compatibility
+                        processed_sample = {
+                            "image": sample["image"].numpy(),  # Convert to numpy
+                            "teacher_image": sample["teacher_image"].numpy(),
+                            "student_text_ids": sample["student_text_ids"].numpy(),
+                            "teacher_text_ids": sample["teacher_text_ids"].numpy(),
+                            "caption": sample["caption"],
+                        }
+                        current_batch.append(processed_sample)
+                        total_samples += 1
+
+                        # When batch is full, save to disk immediately
+                        if len(current_batch) >= batch_size:
+                            batch_dataset = HFDataset.from_list(current_batch)
+                            if temp_cache_dir:
+                                batch_dir = temp_cache_dir / f"batch_{batch_idx:05d}"
+                                batch_dataset.save_to_disk(str(batch_dir))
+                                batch_dirs.append(str(batch_dir))
+                                batch_idx += 1
+                            else:
+                                # If no cache, keep in memory (fallback)
+                                batch_dirs.append(batch_dataset)
+                            current_batch = []  # Clear batch to free memory
                     except Exception as e:
                         print(f"Warning: Failed to process sample at idx {idx}: {e}. Skipping.")
                         continue
@@ -344,25 +379,65 @@ class COCOCaptionDataset(Dataset):
                 print(f"Warning: Failed to load image at idx {idx}: {e}. Skipping.")
                 continue
 
-        print(f"✓ Preprocessed {len(self.samples)} samples from {dataset_len if dataset_len else 'unknown'} images")
+        # Handle remaining samples in the last batch
+        if current_batch:
+            batch_dataset = HFDataset.from_list(current_batch)
+            if temp_cache_dir:
+                batch_dir = temp_cache_dir / f"batch_{batch_idx:05d}"
+                batch_dataset.save_to_disk(str(batch_dir))
+                batch_dirs.append(str(batch_dir))
+            else:
+                batch_dirs.append(batch_dataset)
 
-        # Save to cache for next time
-        if cache_file:
+        num_images = dataset_len if dataset_len else "unknown"
+        print(f"✓ Preprocessed {total_samples} samples from {num_images} images")
+
+        # Load all batches from disk and concatenate
+        if batch_dirs:
+            print(f"Loading and concatenating {len(batch_dirs)} batches from disk...")
+            loaded_batches = []
+            for batch_path in batch_dirs:
+                if isinstance(batch_path, str):
+                    # Load from disk
+                    batch_dataset = load_from_disk(batch_path)
+                else:
+                    # Already in memory (fallback)
+                    batch_dataset = batch_path
+                loaded_batches.append(batch_dataset)
+
+            # Concatenate all batches
+            self.hf_preprocessed = concatenate_datasets(loaded_batches)
+            # Clear loaded batches to free memory
+            loaded_batches = None
+
+            # Clean up temporary batch directories
+            if temp_cache_dir and temp_cache_dir.exists():
+                import shutil
+
+                shutil.rmtree(temp_cache_dir)
+        else:
+            # Empty dataset fallback
+            self.hf_preprocessed = HFDataset.from_dict(
+                {
+                    "image": [],
+                    "teacher_image": [],
+                    "student_text_ids": [],
+                    "teacher_text_ids": [],
+                    "caption": [],
+                }
+            )
+
+        # Save final dataset to cache
+        if cache_path:
             try:
-                # Create cache directory if it doesn't exist
-                cache_dir_path = os.path.dirname(cache_file)
-                if cache_dir_path:
-                    os.makedirs(cache_dir_path, exist_ok=True)
-
-                print(f"Saving preprocessed dataset to cache: {cache_file}")
-                with open(cache_file, "wb") as f:
-                    pickle.dump(self.samples, f)
-                print(f"✓ Cached {len(self.samples)} preprocessed samples")
+                print(f"Saving final preprocessed dataset to cache: {cache_path}")
+                self.hf_preprocessed.save_to_disk(cache_path)
+                print(f"✓ Cached {len(self.hf_preprocessed)} preprocessed samples")
             except Exception as e:
-                print(f"Warning: Failed to save cache file: {e}. Continuing without cache...")
+                print(f"Warning: Failed to save cache: {e}. Continuing without cache...")
 
-    def _get_cache_file_path(self, cache_dir, split, image_size, max_seq_len, use_augmentation):
-        """Generate a unique cache file path based on configuration."""
+    def _get_cache_dir_path(self, cache_dir, split, image_size, max_seq_len, use_augmentation):
+        """Generate a unique cache directory path based on configuration."""
         if cache_dir is None:
             return None
 
@@ -370,8 +445,8 @@ class COCOCaptionDataset(Dataset):
         config_str = f"{split}_{image_size}_{max_seq_len}_{use_augmentation}"
         config_hash = hashlib.md5(config_str.encode()).hexdigest()[:8]
 
-        cache_filename = f"coco_preprocessed_{split}_{config_hash}.pkl"
-        cache_path = Path(cache_dir) / "preprocessed" / cache_filename
+        cache_dir_name = f"coco_preprocessed_{split}_{config_hash}"
+        cache_path = Path(cache_dir) / "preprocessed" / cache_dir_name
 
         return str(cache_path)
 
@@ -482,11 +557,19 @@ class COCOCaptionDataset(Dataset):
 
     def __len__(self):
         """Return the number of samples in the dataset."""
-        return len(self.samples)
+        return len(self.hf_preprocessed)
 
     def __getitem__(self, idx):
         """Get a sample by index."""
-        return self.samples[idx]
+        sample = self.hf_preprocessed[idx]
+        # Convert numpy arrays back to tensors
+        return {
+            "image": torch.from_numpy(sample["image"]),
+            "teacher_image": torch.from_numpy(sample["teacher_image"]),
+            "student_text_ids": torch.from_numpy(sample["student_text_ids"]),
+            "teacher_text_ids": torch.from_numpy(sample["teacher_text_ids"]),
+            "caption": sample["caption"],
+        }
 
 
 def COCOCaptionDatasetFactory(
