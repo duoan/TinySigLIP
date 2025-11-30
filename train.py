@@ -4,6 +4,7 @@ Simplified training script for SigLIP distillation with Hydra configuration.
 
 import math
 import os
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -31,6 +32,13 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
     print("Warning: wandb not installed. Install with: pip install wandb")
+
+try:
+    from fvcore.nn import FlopCountMode, flop_count  # type: ignore[import-untyped]
+
+    FVCORE_AVAILABLE = True
+except ImportError:
+    FVCORE_AVAILABLE = False
 
 from tinysiglip.coco_dataset import COCOCaptionDatasetFactory, collate_coco_batch
 from tinysiglip.embedding_distillation import (
@@ -97,6 +105,61 @@ def format_number(num: int) -> str:
         return f"{num / 1_000:.2f}K"
     else:
         return str(num)
+
+
+def compute_flops(
+    model: nn.Module,
+    image_size: int,
+    text_seq_len: int,
+    device: torch.device,
+) -> dict[str, float | None | str]:
+    """
+    Compute FLOPs (Floating Point Operations) for the model.
+
+    Args:
+        model: The model to compute FLOPs for
+        image_size: Image size (assumed square)
+        text_seq_len: Text sequence length
+        device: Device to run computation on
+
+    Returns:
+        dict: Dictionary with FLOPs metrics
+    """
+    if FVCORE_AVAILABLE:
+        try:
+            # Create dummy inputs
+            dummy_images = torch.randn(1, 3, image_size, image_size).to(device)
+            dummy_text_ids = torch.randint(1, 1000, (1, text_seq_len)).to(device)
+
+            # Count FLOPs
+            flops_dict, _ = flop_count(model, (dummy_images, dummy_text_ids), mode=FlopCountMode.TRAIN)
+            total_flops = sum(flops_dict.values())
+
+            return {
+                "total_flops": total_flops,
+                "total_flops_g": total_flops / 1e9,  # GFLOPs
+                "flops_per_sample": total_flops,
+            }
+        except Exception as e:
+            print(f"Warning: Could not compute FLOPs with fvcore: {e}")
+            return {"total_flops": None, "total_flops_g": None, "flops_per_sample": None}
+    else:
+        # Simple estimation based on model parameters and operations
+        # This is a rough estimate
+        total_params = sum(p.numel() for p in model.parameters())
+        # Rough estimate: 2 FLOPs per parameter per forward pass
+        # For vision: image_size^2 * 3 * 2 (rough estimate)
+        # For text: text_seq_len * vocab_size * 2 (rough estimate)
+        vision_flops_estimate = image_size * image_size * 3 * 2 * total_params * 0.5  # Rough estimate
+        text_flops_estimate = text_seq_len * 1000 * 2 * total_params * 0.5  # Rough estimate
+        total_flops_estimate = vision_flops_estimate + text_flops_estimate
+
+        return {
+            "total_flops": total_flops_estimate,
+            "total_flops_g": total_flops_estimate / 1e9,
+            "flops_per_sample": total_flops_estimate,
+            "note": "Estimated (install fvcore for accurate FLOPs)",
+        }
 
 
 def get_teacher_model(model_name="google/siglip2-base-patch16-224", device=None) -> SiglipModel:
@@ -657,9 +720,33 @@ def main(cfg: DictConfig) -> None:
     else:
         model_to_train = student_model
     model_to_train.train()
+
+    # Compute FLOPs (only once, on main process, after model is ready)
+    flops_metrics = {}
+    if is_main_process(rank):
+        print("\n=== Computing Model FLOPs ===")
+        flops_metrics = compute_flops(model_to_train, IMAGE_SIZE, TEXT_SEQ_LEN, device)
+        if flops_metrics.get("total_flops") is not None:
+            print(f"Total FLOPs: {flops_metrics['total_flops']:.2e}")
+            print(f"Total GFLOPs: {flops_metrics['total_flops_g']:.2f}")
+            if "note" in flops_metrics:
+                print(f"Note: {flops_metrics['note']}")
+        else:
+            print("Could not compute FLOPs")
+        print("=" * 30 + "\n")
+
     if is_main_process(rank):
         print(f"\nStarting training for {NUM_EPOCHS} epochs...")
         print(f"Total steps: {total_steps} ({steps_per_epoch} steps per epoch)")
+
+    # Initialize performance tracking
+    performance_tracker = {
+        "samples_seen": 0,
+        "tokens_seen": 0,
+        "epoch_start_time": None,
+        "step_times": [],
+        "batch_times": [],
+    }
 
     # Initialize early stopping
     best_monitor_value = None
@@ -690,6 +777,10 @@ def main(cfg: DictConfig) -> None:
         if use_distributed and sampler is not None:
             sampler.set_epoch(epoch)
 
+        # Track epoch start time
+        epoch_start_time = time.time()
+        performance_tracker["epoch_start_time"] = epoch_start_time
+
         # Epoch-level progress bar
         epoch_pbar = tqdm(
             dataloader,
@@ -702,6 +793,9 @@ def main(cfg: DictConfig) -> None:
         epoch_loss_dict_sum = {}
 
         for batch_idx, batch in enumerate(epoch_pbar):
+            # Track batch processing time
+            batch_start_time = time.time()
+
             if USE_REAL_DATA:
                 # COCO dataset returns a dict
                 student_images = batch["student_images"].to(device)
@@ -716,6 +810,15 @@ def main(cfg: DictConfig) -> None:
                 student_text_ids = text_ids_student.to(device)
                 # Clamp to ensure they're within teacher vocab range
                 teacher_text_ids = torch.clamp(student_text_ids, max=max_valid_token_id_teacher)
+
+            # Track samples and tokens
+            batch_size = student_images.size(0)
+            actual_batch_size = batch_size * world_size if use_distributed else batch_size
+            performance_tracker["samples_seen"] += actual_batch_size
+            # Count non-padding tokens (assuming 0 is padding token)
+            num_tokens_batch = (student_text_ids > 0).sum().item()
+            num_tokens = num_tokens_batch * world_size if use_distributed else num_tokens_batch
+            performance_tracker["tokens_seen"] += num_tokens
 
             optimizer.zero_grad()
 
@@ -764,12 +867,24 @@ def main(cfg: DictConfig) -> None:
             )
 
             # Backward
+            backward_start_time = time.time()
             loss.backward()
             optimizer.step()
 
             # Update learning rate
             if scheduler is not None:
                 scheduler.step()
+
+            # Track timing
+            batch_end_time = time.time()
+            batch_time = batch_end_time - batch_start_time
+            step_time = batch_end_time - backward_start_time  # Time for backward + optimizer step
+            performance_tracker["batch_times"].append(batch_time)
+            performance_tracker["step_times"].append(step_time)
+            # Keep only last 100 timings for rolling average
+            if len(performance_tracker["batch_times"]) > 100:
+                performance_tracker["batch_times"] = performance_tracker["batch_times"][-100:]
+                performance_tracker["step_times"] = performance_tracker["step_times"][-100:]
 
             global_step += 1
 
@@ -851,14 +966,31 @@ def main(cfg: DictConfig) -> None:
                             )
                             print(f"{'=' * 70}\n")
 
+            # Compute performance metrics
+            recent_batch_times = performance_tracker["batch_times"][-10:]
+            avg_batch_time = sum(recent_batch_times) / min(10, len(recent_batch_times))
+            samples_per_sec = actual_batch_size / avg_batch_time if avg_batch_time > 0 else 0
+            tokens_per_sec = num_tokens / avg_batch_time if avg_batch_time > 0 else 0
+
             # Update epoch progress bar
             current_lr = optimizer.param_groups[0]["lr"]
             epoch_pbar.set_postfix(
                 {
                     **{k: f"{v / (batch_idx + 1):.4f}" for k, v in epoch_loss_dict_sum.items()},
                     "lr": f"{current_lr:.2e}",
+                    "samples/s": f"{samples_per_sec:.1f}",
+                    "tokens/s": f"{tokens_per_sec:.0f}",
                 }
             )
+
+            # Compute performance metrics for logging
+            recent_batch_times = performance_tracker["batch_times"][-10:]
+            recent_step_times = performance_tracker["step_times"][-10:]
+            avg_batch_time = sum(recent_batch_times) / min(10, len(recent_batch_times))
+            avg_step_time = sum(recent_step_times) / min(10, len(recent_step_times))
+            samples_per_sec = actual_batch_size / avg_batch_time if avg_batch_time > 0 else 0
+            tokens_per_sec = num_tokens / avg_batch_time if avg_batch_time > 0 else 0
+            images_per_sec = actual_batch_size / avg_batch_time if avg_batch_time > 0 else 0
 
             # Log to WandB
             if wandb_enabled:
@@ -870,7 +1002,17 @@ def main(cfg: DictConfig) -> None:
                     "train/learning_rate": current_lr,
                     "train/step": global_step,
                     "train/epoch": epoch + 1,
+                    "train/samples_seen": performance_tracker["samples_seen"],
+                    "train/tokens_seen": performance_tracker["tokens_seen"],
+                    "train/samples_per_sec": samples_per_sec,
+                    "train/tokens_per_sec": tokens_per_sec,
+                    "train/images_per_sec": images_per_sec,
+                    "train/batch_time_ms": avg_batch_time * 1000,
+                    "train/step_time_ms": avg_step_time * 1000,
                 }
+                # Add FLOPs metrics if available (log once per epoch)
+                if batch_idx == 0 and flops_metrics.get("total_flops_g") is not None:
+                    wandb_log["model/flops_g"] = flops_metrics["total_flops_g"]
                 # Add evaluation metrics if available
                 if eval_metrics:
                     wandb_log.update({f"eval/{k}": v for k, v in eval_metrics.items()})
@@ -881,6 +1023,13 @@ def main(cfg: DictConfig) -> None:
                 log_message = (
                     f"\nEpoch {epoch + 1}/{NUM_EPOCHS}, Step {global_step}/{total_steps}: "
                     f"Loss: {loss_dict} | LR: {current_lr:.2e}"
+                )
+                # Add performance metrics
+                log_message += (
+                    f"\n  Performance: {samples_per_sec:.1f} samples/s, "
+                    f"{tokens_per_sec:.0f} tokens/s, {images_per_sec:.1f} images/s | "
+                    f"Batch time: {avg_batch_time * 1000:.1f}ms | "
+                    f"Samples seen: {performance_tracker['samples_seen']:,}"
                 )
                 if eval_metrics:
                     # Format metrics nicely
@@ -910,6 +1059,12 @@ def main(cfg: DictConfig) -> None:
         # Calculate epoch average losses
         epoch_avg_loss_dict = {k: v / len(dataloader) for k, v in epoch_loss_dict_sum.items()}
 
+        # Calculate epoch performance metrics
+        epoch_time = time.time() - epoch_start_time
+        epoch_samples_per_sec = len(dataset) / epoch_time if epoch_time > 0 else 0
+        batch_times = performance_tracker["batch_times"]
+        epoch_avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
+
         # Update main progress bar
         current_lr = optimizer.param_groups[0]["lr"]
         pbar.set_postfix(
@@ -917,6 +1072,7 @@ def main(cfg: DictConfig) -> None:
                 **{k: f"{v:.4f}" for k, v in epoch_avg_loss_dict.items()},
                 "best": f"{best_monitor_value:.4f}" if best_monitor_value is not None else "N/A",
                 "lr": f"{current_lr:.2e}",
+                "samples/s": f"{epoch_samples_per_sec:.1f}",
             }
         )
         pbar.update(1)
@@ -925,6 +1081,13 @@ def main(cfg: DictConfig) -> None:
         if is_main_process(rank):
             log_message = (
                 f"\nEpoch {epoch + 1}/{NUM_EPOCHS} completed: Avg Loss: {epoch_avg_loss_dict} | LR: {current_lr:.2e}"
+            )
+            log_message += (
+                f"\n  Epoch time: {epoch_time:.1f}s | "
+                f"Throughput: {epoch_samples_per_sec:.1f} samples/s | "
+                f"Avg batch time: {epoch_avg_batch_time * 1000:.1f}ms | "
+                f"Samples seen: {performance_tracker['samples_seen']:,} | "
+                f"Tokens: {performance_tracker['tokens_seen']:,}"
             )
             if early_stopping_enabled:
                 steps_since_best = global_step - best_step if best_step > 0 else 0
@@ -967,10 +1130,22 @@ def main(cfg: DictConfig) -> None:
 
     # Log final metrics to WandB
     if wandb_enabled:
+        epoch_start = performance_tracker.get("epoch_start_time")
+        total_training_time = time.time() - epoch_start if epoch_start is not None else time.time()
         wandb.summary["final_step"] = global_step
         wandb.summary["final_epoch"] = epoch + 1
         wandb.summary["total_steps"] = total_steps
         wandb.summary["total_epochs"] = NUM_EPOCHS
+        wandb.summary["total_samples_seen"] = performance_tracker["samples_seen"]
+        wandb.summary["total_tokens_seen"] = performance_tracker["tokens_seen"]
+        wandb.summary["total_training_time_seconds"] = total_training_time
+        if flops_metrics.get("total_flops_g") is not None:
+            flops_g = flops_metrics["total_flops_g"]
+            if isinstance(flops_g, (int, float)):
+                wandb.summary["model/flops_g"] = flops_g
+            flops_total = flops_metrics["total_flops"]
+            if isinstance(flops_total, (int, float)):
+                wandb.summary["model/flops"] = flops_total
 
     # Save checkpoint only on main process
     if is_main_process(rank):
