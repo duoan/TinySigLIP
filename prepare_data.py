@@ -269,6 +269,84 @@ def download_coco_images(dataset: Any, data_dir: Path, split: str, num_workers: 
     return downloaded, skipped, failed
 
 
+def _normalize_image_id(image_id, fallback: int) -> int:
+    """Convert image_id to int safely."""
+    try:
+        if hasattr(image_id, "item"):
+            return int(image_id.item())
+        if isinstance(image_id, str):
+            return int(image_id)
+        if isinstance(image_id, int):
+            return image_id
+        return int(image_id)
+    except (ValueError, OverflowError, TypeError):
+        return fallback
+
+
+class CocoEmbeddingDataset(torch.utils.data.Dataset):
+    """
+    Simple Dataset wrapper to load COCO images and captions.
+
+    We still use the teacher's own image_processor, but we move the
+    PIL image loading into workers (when num_workers > 0) to parallelize
+    disk I/O and JPEG decode.
+    """
+
+    def __init__(self, hf_dataset: Any, images_dir: Path, split_name: str):
+        self.hf_dataset = hf_dataset
+        self.images_dir = images_dir
+        self.split_name = split_name
+
+    def __len__(self) -> int:
+        return len(self.hf_dataset)
+
+    def __getitem__(self, idx: int):
+        example = self.hf_dataset[idx]
+
+        image_id = _normalize_image_id(example.get("image_id"), idx)
+
+        file_name = example["file_name"]
+        image_filename = file_name.split("/")[-1]
+        image_path_file = self.images_dir / image_filename
+        if not image_path_file.exists():
+            print(f"Warning: Image file not found: {image_path_file}. Skipping.")
+            return None
+
+        image = Image.open(image_path_file).convert("RGB")
+
+        captions = example.get("captions", [])
+        if isinstance(captions, str):
+            captions = [captions]
+        if len(captions) == 0:
+            captions = ["a photo"]
+
+        return {
+            "pil_image": image,
+            "image_id": image_id,
+            "image_path": f"{self.split_name}/{image_filename}",
+            "captions": captions,
+        }
+
+
+def coco_collate_fn(batch):
+    """Collate function that filters out missing samples and groups per-batch data."""
+    batch = [item for item in batch if item is not None]
+    if len(batch) == 0:
+        return None
+
+    pil_images = [item["pil_image"] for item in batch]
+    image_ids = [item["image_id"] for item in batch]
+    image_paths = [item["image_path"] for item in batch]
+    captions = [item["captions"] for item in batch]
+
+    return {
+        "pil_images": pil_images,
+        "image_ids": image_ids,
+        "image_paths": image_paths,
+        "captions": captions,
+    }
+
+
 def get_dataset_size_name(max_samples: int | None) -> str:
     """
     Get dataset size name based on max_samples.
@@ -300,6 +378,7 @@ def extract_teacher_embeddings(
     batch_size: int = 32,
     cache_dir: Path | str | None = None,
     num_workers: int = 4,
+    image_size: int | None = None,
 ):
     """
     Extract teacher embeddings grouped by image_id.
@@ -317,9 +396,10 @@ def extract_teacher_embeddings(
         teacher_model_name: Name/identifier of the teacher model (e.g., "google/siglip2-base-patch16-224")
         split: Dataset split ('train', 'val', etc.)
         max_samples: Maximum number of samples used (None for full dataset)
-        batch_size: Batch size parameter (kept for compatibility, not actively used since COCO has max 4 captions)
+        batch_size: Batch size for GPU processing (images per forward pass)
         cache_dir: Base cache directory
-        num_workers: Number of data loading workers (not used in this function)
+        num_workers: Number of DataLoader worker processes for image loading
+        image_size: Override image size for preprocessing (defaults to teacher processor config)
     """
     """
     Extract teacher embeddings grouped by image_id.
@@ -357,11 +437,8 @@ def extract_teacher_embeddings(
     # utilization of one strong GPU. If you want real multi-GPU speedup,
     # it's better handled at the training stage rather than in this
     # one-off embedding extraction script.
+    # Always use a single device (typically cuda:0) for robustness
     devices = [devices[0]]
-    num_devices = 1
-    use_multi_gpu = False
-
-    # Single device: use the first device
     device = devices[0]
     teacher_model = teacher_model.to(device)
     teacher_model.eval()
@@ -464,20 +541,17 @@ def extract_teacher_embeddings(
     # Configuration: save every N images to a batch file
     images_per_batch = 100  # Save every 100 images to a separate file
 
-    # Processing batch size for GPU (larger batch = better GPU utilization)
-    processing_batch_size = batch_size if batch_size > 0 else 32
-
     # Storage for current batch
-    current_batch_data = {}
+    current_batch_data: dict[int, tuple[int, str, torch.Tensor, list[tuple[int, torch.Tensor, str]]]] = {}
     batch_file_counter = 0
     caption_id_counter = 0
     total_captions = 0
     total_images = 0
 
     # Index file: maps image_id to (batch_file_idx, local_idx_in_batch)
-    image_index = {}  # image_id -> (batch_file_idx, local_idx)
+    image_index: dict[int, tuple[int, int]] = {}
     # Sample indices: maps sample_idx -> (image_id, caption_idx) for expanding multiple captions per image
-    sample_indices = []
+    sample_indices: list[tuple[int, int]] = []
 
     def save_batch(batch_data: dict, batch_idx: int):
         """Save a batch of image data to disk."""
@@ -485,199 +559,93 @@ def extract_teacher_embeddings(
         torch.save(batch_data, batch_file)
         return batch_file
 
-    # Track processed image_ids to avoid duplicates
-    processed_image_ids = set()
+    # Build Dataset + DataLoader to parallelize image loading & decoding
+    dataset = CocoEmbeddingDataset(hf_dataset=hf_dataset, images_dir=images_dir, split_name=split_name)
+
+    dl_num_workers = max(num_workers, 0)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=dl_num_workers,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=coco_collate_fn,
+    )
 
     with torch.no_grad():
-        # Process images in batches for better GPU utilization
-        image_batch_items = []  # List of (idx, example, image_id, image_path, image, captions, device_idx)
-
-        def process_image_batch(batch_items):
-            """Process a batch of images together for better GPU utilization."""
-            nonlocal caption_id_counter, total_captions, current_batch_data, image_index
-
-            if not batch_items:
-                return
-
-            # Group by device for multi-GPU
-            device_batches = {}
-            for item in batch_items:
-                idx, example, image_id, image_path, image, captions, device_idx = item
-                if device_idx not in device_batches:
-                    device_batches[device_idx] = []
-                device_batches[device_idx].append(item)
-
-            # Process each device batch
-            # NOTE: we currently force single-device execution above, so
-            # this will always run on devices[0] with the single teacher_model.
-            for _, items in device_batches.items():
-                current_device = devices[0]
-                current_model = teacher_model
-
-                # Extract images and prepare batch
-                batch_images = [item[4] for item in items]  # Extract images
-                batch_image_ids = [item[2] for item in items]  # Extract image_ids
-                batch_image_paths = [item[3] for item in items]  # Extract image_paths
-                batch_captions_list = [item[5] for item in items]  # Extract captions lists
-
-                # Batch process images
-                image_tensors = teacher_processor.image_processor(batch_images, return_tensors="pt")["pixel_values"].to(
-                    current_device
-                )
-
-                # Get image features in batch
-                image_embs = current_model.get_image_features(pixel_values=image_tensors).detach().cpu()
-                # (batch_size, D_proj)
-
-                # Process captions for all images
-                all_captions = []
-                caption_offsets = [0]  # Track where each image's captions start in all_captions
-
-                for image_id, captions in zip(batch_image_ids, batch_captions_list, strict=True):
-                    # Build sample_indices for all captions
-                    for cap_idx in range(len(captions)):
-                        sample_indices.append((image_id, cap_idx))
-                        all_captions.append(captions[cap_idx])
-                    caption_offsets.append(len(all_captions))
-
-                # Process captions in batch if any
-                if all_captions:
-                    # Ensure captions are strings
-                    captions_clean = [str(cap) if not isinstance(cap, str) else cap for cap in all_captions]
-
-                    # Batch process all captions
-                    max_length = max_position_embeddings
-                    caption_text_ids = teacher_processor.tokenizer(
-                        captions_clean,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=max_length,
-                    )["input_ids"].to(current_device)
-
-                    # Get text features in batch
-                    caption_embs = current_model.get_text_features(input_ids=caption_text_ids).detach().cpu()
-                    # (total_captions, D_proj)
-
-                    del caption_text_ids
-                else:
-                    caption_embs = None
-
-                # Group captions back to images and store
-                for img_idx, (image_id, image_path, image_emb, captions) in enumerate(
-                    zip(batch_image_ids, batch_image_paths, image_embs, batch_captions_list, strict=True)
-                ):
-                    caption_data_list = []
-                    caption_start = caption_offsets[img_idx]
-                    caption_end = caption_offsets[img_idx + 1]
-
-                    if caption_embs is not None and caption_start < caption_end:
-                        for cap_idx, caption in enumerate(captions):
-                            caption_emb = caption_embs[caption_start + cap_idx]
-                            caption_data_list.append((caption_id_counter, caption_emb, caption))
-                            caption_id_counter += 1
-                            total_captions += 1
-
-                    # Store in current batch
-                    local_idx = len(current_batch_data)
-                    current_batch_data[local_idx] = (image_id, image_path, image_emb, caption_data_list)
-                    image_index[image_id] = (batch_file_counter, local_idx)
-
-                # Clean up
-                del image_tensors, image_embs
-                if caption_embs is not None:
-                    del caption_embs
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-        # Collect and process images in batches
-        for idx in tqdm(range(len(hf_dataset)), desc="Processing images"):
-            try:
-                example = hf_dataset[idx]
-
-                # Get image_id
-                image_id = example["image_id"]
-                if isinstance(image_id, list):
-                    image_id = image_id[0] if image_id else idx
-
-                # Convert to Python int safely
-                try:
-                    if hasattr(image_id, "item"):
-                        image_id = int(image_id.item())
-                    elif isinstance(image_id, str):
-                        image_id = int(image_id)
-                    elif not isinstance(image_id, int):
-                        image_id = int(image_id)
-                except (ValueError, OverflowError, TypeError) as e:
-                    print(
-                        f"Warning: Failed to convert image_id {image_id} (type: {type(image_id)}): {e}. "
-                        f"Using index {idx} instead."
-                    )
-                    image_id = idx
-
-                # Skip if already processed
-                if image_id in processed_image_ids:
-                    continue
-                processed_image_ids.add(image_id)
-
-                # Load image from file
-                file_name = example["file_name"]
-                image_filename = file_name.split("/")[-1]
-                image_path_file = images_dir / image_filename
-                if not image_path_file.exists():
-                    print(f"Warning: Image file not found: {image_path_file}. Skipping.")
-                    continue
-                image = Image.open(image_path_file).convert("RGB")
-
-                # Get captions
-                captions = example.get("captions", [])
-                if isinstance(captions, str):
-                    captions = [captions]
-                if len(captions) == 0:
-                    captions = ["a photo"]
-
-                # Build relative path
-                image_path = f"{split_name}/{image_filename}"
-
-                # Select device for this image (round-robin for multi-GPU)
-                device_idx = idx % num_devices if use_multi_gpu else 0
-
-                # Add to batch
-                image_batch_items.append((idx, example, image_id, image_path, image, captions, device_idx))
-
-                # Process batch when it reaches the processing batch size
-                if len(image_batch_items) >= processing_batch_size:
-                    process_image_batch(image_batch_items)
-                    image_batch_items = []  # Clear batch
-
-                    # Save batch when it reaches the threshold
-                    if len(current_batch_data) >= images_per_batch:
-                        batch_file = save_batch(current_batch_data, batch_file_counter)
-                        print(
-                            f"  Saved batch {batch_file_counter} with {len(current_batch_data)} images "
-                            f"to {batch_file.name}"
-                        )
-                        total_images += len(current_batch_data)
-                        current_batch_data = {}  # Clear for next batch
-                        batch_file_counter += 1
-
-            except Exception as e:
-                import traceback
-
-                error_msg = str(e)
-                if "int too big" in error_msg.lower() or "overflow" in error_msg.lower():
-                    print(f"\n{'=' * 60}")
-                    print(f"ERROR: Failed to process image {idx}: {e}")
-                    print(f"{'=' * 60}")
-                    traceback.print_exc()
-                    print(f"{'=' * 60}\n")
-                else:
-                    print(f"Warning: Failed to process image {idx}: {e}. Skipping.")
+        for batch in tqdm(dataloader, desc="Processing images"):
+            if batch is None:
                 continue
 
-        # Process remaining images
-        if image_batch_items:
-            process_image_batch(image_batch_items)
+            pil_images = batch["pil_images"]
+            image_ids = [int(i) for i in batch["image_ids"]]
+            image_paths = batch["image_paths"]
+            captions_per_image = batch["captions"]
+
+            # Move images through teacher image_processor on CPU, then send to GPU as a batch
+            image_inputs = teacher_processor.image_processor(pil_images, return_tensors="pt")
+            image_tensors = image_inputs["pixel_values"].to(device)
+
+            # Get image features in batch
+            image_embs = teacher_model.get_image_features(pixel_values=image_tensors).detach().cpu()
+
+            # Build flattened caption list and sample_indices
+            all_captions: list[str] = []
+            caption_offsets = [0]
+            for image_id, caps in zip(image_ids, captions_per_image, strict=True):
+                for cap_idx, cap in enumerate(caps):
+                    sample_indices.append((image_id, cap_idx))
+                    all_captions.append(str(cap) if not isinstance(cap, str) else cap)
+                caption_offsets.append(len(all_captions))
+
+            # Encode all captions in this batch at once
+            if all_captions:
+                max_length = max_position_embeddings
+                caption_input_ids = teacher_processor.tokenizer(
+                    all_captions,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=max_length,
+                )["input_ids"].to(device)
+                caption_embs = teacher_model.get_text_features(input_ids=caption_input_ids).detach().cpu()
+                del caption_input_ids
+            else:
+                caption_embs = None
+
+            # Group caption embeddings back per image and populate cache structures
+            for img_idx, (image_id, image_path, image_emb, caps) in enumerate(
+                zip(image_ids, image_paths, image_embs, captions_per_image, strict=True)
+            ):
+                caption_data_list: list[tuple[int, torch.Tensor, str]] = []
+                start = caption_offsets[img_idx]
+                end = caption_offsets[img_idx + 1]
+
+                if caption_embs is not None and start < end:
+                    for local_cap_idx, caption in enumerate(caps):
+                        cap_emb = caption_embs[start + local_cap_idx]
+                        caption_data_list.append((caption_id_counter, cap_emb, caption))
+                        caption_id_counter += 1
+                        total_captions += 1
+
+                local_idx = len(current_batch_data)
+                current_batch_data[local_idx] = (image_id, image_path, image_emb, caption_data_list)
+                image_index[image_id] = (batch_file_counter, local_idx)
+                total_images += 1
+
+            # Clean up
+            del image_tensors, image_embs
+            if caption_embs is not None:
+                del caption_embs
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Save batch when it reaches the threshold
+            if len(current_batch_data) >= images_per_batch:
+                batch_file = save_batch(current_batch_data, batch_file_counter)
+                print(f"  Saved batch {batch_file_counter} with {len(current_batch_data)} images to {batch_file.name}")
+                current_batch_data = {}
+                batch_file_counter += 1
 
         # Save remaining images in the last batch
         if len(current_batch_data) > 0:
@@ -930,7 +898,7 @@ Examples:
                 max_samples=args.max_samples,
                 batch_size=args.batch_size,
                 cache_dir=str(cache_dir),
-                num_workers=0,  # Set to 0 to avoid multiprocessing issues, can be increased if needed
+                num_workers=args.num_workers,  # Reuse num_workers for DataLoader image loading
             )
         except Exception as e:
             print(f"✗ Error extracting embeddings: {e}")
