@@ -7,11 +7,11 @@ defaults:
   - _self_
 
 # Training configuration overrides for 8x A100 40GB
-# Effective batch size = batch_size × 8 GPUs = 128 × 8 = 1024
+# Effective batch size = batch_size × 8 GPUs = 256 × 8 = 2048
 training:
-  batch_size: 128  # Per GPU batch size (effective: 1024 with 8 GPUs)
-  num_epochs: 2  # ~1-2 epochs on COCO train set
-  learning_rate: 4.0e-4  # Scaled for large batch size (sqrt scaling: 5e-5 × sqrt(1024/16) ≈ 4e-4)
+  batch_size: 256  # Per GPU batch size (effective: 2048 with 8 GPUs)
+  num_epochs: 8  # ~1-2 epochs on COCO train set
+  learning_rate: 4.0e-4  # Scaled for large batch size (sqrt scaling: 5e-5 × sqrt(2048/16) ≈ 4e-4)
   warmup_epochs: 0.1  # ~6% of training for stable training start
 
 # Dataset configuration overrides
