@@ -40,6 +40,8 @@ from urllib.request import urlretrieve
 import torch
 from PIL import Image
 
+BatchEntry = tuple[int, str, torch.Tensor, list[tuple[int, torch.Tensor, str]]]
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -555,7 +557,7 @@ def extract_teacher_embeddings(
     # This is configurable via the images_per_batch argument.
 
     # Storage for current batch
-    current_batch_data: dict[int, tuple[int, str, torch.Tensor, list[tuple[int, torch.Tensor, str]]]] = {}
+    current_batch_entries: list[BatchEntry] = []
     batch_file_counter = 0
     caption_id_counter = 0
     total_captions = 0
@@ -566,11 +568,35 @@ def extract_teacher_embeddings(
     # Sample indices: maps sample_idx -> (image_id, caption_idx) for expanding multiple captions per image
     sample_indices: list[tuple[int, int]] = []
 
-    def save_batch(batch_data: dict, batch_idx: int):
+    def save_batch(batch_entries: list[BatchEntry], batch_idx: int):
         """Save a batch of image data to disk."""
+        batch_dict = dict(enumerate(batch_entries))
         batch_file = cache_dir / f"batch_{batch_idx:06d}.pt"
-        torch.save(batch_data, batch_file)
+        torch.save(batch_dict, batch_file)
         return batch_file
+
+    def flush_ready_batches(force: bool = False):
+        """Write buffered batches to disk respecting images_per_batch."""
+        nonlocal current_batch_entries, batch_file_counter
+
+        def _write_chunk(chunk: list[BatchEntry], is_final: bool):
+            nonlocal batch_file_counter
+            batch_file = save_batch(chunk, batch_file_counter)
+            for local_idx, (img_id, _, _, _) in enumerate(chunk):
+                image_index[img_id] = (batch_file_counter, local_idx)
+            label = "final batch" if is_final else "batch"
+            print(f"  Saved {label} {batch_file_counter} with {len(chunk)} images to {batch_file.name}")
+            batch_file_counter += 1
+
+        while len(current_batch_entries) >= images_per_batch:
+            chunk = current_batch_entries[:images_per_batch]
+            _write_chunk(chunk, is_final=False)
+            current_batch_entries = current_batch_entries[images_per_batch:]
+
+        if force and current_batch_entries:
+            chunk = current_batch_entries
+            _write_chunk(chunk, is_final=True)
+            current_batch_entries = []
 
     # Build Dataset + DataLoader to parallelize image loading & decoding
     dataset = CocoEmbeddingDataset(hf_dataset=hf_dataset, images_dir=images_dir, split_name=split_name)
@@ -641,9 +667,7 @@ def extract_teacher_embeddings(
                         caption_id_counter += 1
                         total_captions += 1
 
-                local_idx = len(current_batch_data)
-                current_batch_data[local_idx] = (image_id, image_path, image_emb, caption_data_list)
-                image_index[image_id] = (batch_file_counter, local_idx)
+                current_batch_entries.append((image_id, image_path, image_emb, caption_data_list))
                 total_images += 1
 
             # Clean up
@@ -653,21 +677,11 @@ def extract_teacher_embeddings(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            # Save batch when it reaches the threshold
-            if len(current_batch_data) >= images_per_batch:
-                batch_file = save_batch(current_batch_data, batch_file_counter)
-                print(f"  Saved batch {batch_file_counter} with {len(current_batch_data)} images to {batch_file.name}")
-                current_batch_data = {}
-                batch_file_counter += 1
+            # Save batches when buffer exceeds threshold
+            flush_ready_batches()
 
-        # Save remaining images in the last batch
-        if len(current_batch_data) > 0:
-            batch_file = save_batch(current_batch_data, batch_file_counter)
-            print(
-                f"  Saved final batch {batch_file_counter} with {len(current_batch_data)} images to {batch_file.name}"
-            )
-            total_images += len(current_batch_data)
-            batch_file_counter += 1
+        # Save remaining images in the buffer
+        flush_ready_batches(force=True)
 
     # Save index file: maps image_id to (batch_file_idx, local_idx)
     print("Creating index file...")
@@ -922,7 +936,7 @@ Examples:
                 batch_size=args.batch_size,
                 cache_dir=str(cache_dir),
                 num_workers=args.num_workers,  # Reuse num_workers for DataLoader image loading
-                images_per_batch=args.images_per_batch,
+                images_per_batch=args.images_per_batch_size,
             )
         except Exception as e:
             print(f"✗ Error extracting embeddings: {e}")
