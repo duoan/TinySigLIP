@@ -379,6 +379,7 @@ def extract_teacher_embeddings(
     cache_dir: Path | str | None = None,
     num_workers: int = 4,
     image_size: int | None = None,
+    images_per_batch: int = 2000,
 ):
     """
     Extract teacher embeddings grouped by image_id.
@@ -539,7 +540,9 @@ def extract_teacher_embeddings(
     print("Saving in separate batch files for efficient memory usage...")
 
     # Configuration: save every N images to a batch file
-    images_per_batch = 100  # Save every 100 images to a separate file
+    # Larger values => fewer, bigger .pt files (less frequent disk I/O during training),
+    # smaller values => more, smaller files (less memory per loaded batch).
+    # This is configurable via the images_per_batch argument.
 
     # Storage for current batch
     current_batch_data: dict[int, tuple[int, str, torch.Tensor, list[tuple[int, torch.Tensor, str]]]] = {}
@@ -766,6 +769,16 @@ Examples:
         help="Batch size for embedding extraction",
     )
     parser.add_argument(
+        "--images-per-batch",
+        type=int,
+        default=2000,
+        help=(
+            "Number of images to store in each cached teacher batch file. "
+            "Larger values create fewer, larger .pt files (less frequent disk I/O during training) "
+            "but require more RAM per loaded batch."
+        ),
+    )
+    parser.add_argument(
         "--image-size",
         type=int,
         default=224,
@@ -899,6 +912,7 @@ Examples:
                 batch_size=args.batch_size,
                 cache_dir=str(cache_dir),
                 num_workers=args.num_workers,  # Reuse num_workers for DataLoader image loading
+                images_per_batch=args.images_per_batch,
             )
         except Exception as e:
             print(f"✗ Error extracting embeddings: {e}")
