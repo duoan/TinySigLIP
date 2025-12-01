@@ -795,7 +795,7 @@ Examples:
     parser.add_argument(
         "--images-per-batch",
         type=int,
-        default=2000,
+        default=200,
         help=(
             "Number of images to store in each cached teacher batch file. "
             "Larger values create fewer, larger .pt files (less frequent disk I/O during training) "
