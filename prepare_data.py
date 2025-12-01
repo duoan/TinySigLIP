@@ -315,7 +315,14 @@ class CocoEmbeddingDataset(torch.utils.data.Dataset):
             print(f"Warning: Image file not found: {image_path_file}. Skipping.")
             return None
 
-        image = Image.open(image_path_file).convert("RGB")
+        # Some COCO images can be corrupted or truncated. In that case, PIL will raise
+        # an OSError (e.g. "image file is truncated"). We catch it here and skip
+        # the problematic sample instead of crashing the whole job.
+        try:
+            image = Image.open(image_path_file).convert("RGB")
+        except OSError as e:
+            print(f"Warning: Failed to open image {image_path_file} ({e}). Skipping this sample.")
+            return None
 
         captions = example.get("captions", [])
         if isinstance(captions, str):
