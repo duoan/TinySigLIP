@@ -936,7 +936,7 @@ Examples:
                 batch_size=args.batch_size,
                 cache_dir=str(cache_dir),
                 num_workers=args.num_workers,  # Reuse num_workers for DataLoader image loading
-                images_per_batch=args.images_per_batch_size,
+                images_per_batch=args.images_per_batch,
             )
         except Exception as e:
             print(f"✗ Error extracting embeddings: {e}")
