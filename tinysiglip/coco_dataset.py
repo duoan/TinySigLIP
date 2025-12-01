@@ -101,7 +101,7 @@ class COCOCaptionDataset(Dataset):
         #   * we call _maintain_teacher_cache() to:
         #       - evict oldest entries if cache > N
         #       - preload new batch files while cache < N (if there are any left)
-        self._teacher_prefetch_size = 4
+        self._teacher_prefetch_size = 2
         self._all_teacher_batch_indices = sorted({int(batch_idx) for batch_idx, _ in self.image_index.values()})
         self._teacher_prefetch_cursor = 0
 
