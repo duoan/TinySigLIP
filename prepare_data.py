@@ -31,6 +31,7 @@ GPU Usage:
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,8 @@ from urllib.request import urlretrieve
 
 import torch
 from PIL import Image
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def get_device():
