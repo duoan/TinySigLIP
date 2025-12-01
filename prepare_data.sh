@@ -7,20 +7,101 @@
 # 3. Extract and cache teacher model embeddings
 #
 # Usage:
-#   ./prepare_data.sh                    # Use all defaults
+#   ./prepare_data.sh                    # Use all defaults (auto-detects machine type)
 #   ./prepare_data.sh --cache-dir /custom/path/cache
 #   ./prepare_data.sh --max-samples 1000  # Small dataset for local dev (1K samples)
 #   ./prepare_data.sh --skip-download    # Skip download if data exists
 #   ./prepare_data.sh --skip-embeddings  # Skip embedding extraction
+#
+# Auto-detection:
+#   The script automatically detects machine type and adjusts batch_size and num_workers:
+#   - Local machines: batch_size=32, num_workers=16 (I/O optimized, scales with CPU cores)
+#   - Remote/high-performance machines: batch_size=128, num_workers=64-128 (I/O optimized)
+#   - num_workers is optimized for I/O-intensive image downloads (can use many concurrent workers)
+#   - Set REMOTE_MACHINE=true to force high-performance mode
+#   - You can still override with --batch-size and --num-workers flags
 
 set -e  # Exit on error
 
-# Default parameters
+# Function to detect machine type and set optimal defaults
+detect_machine_type() {
+    local cpu_cores
+    local total_memory_gb
+    local gpu_count=0
+    local is_remote=false
+
+    # Detect CPU cores
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        # macOS
+        cpu_cores=$(sysctl -n hw.ncpu 2>/dev/null || echo "4")
+        total_memory_gb=$(($(sysctl -n hw.memsize 2>/dev/null || echo "8589934592") / 1024 / 1024 / 1024))
+    else
+        # Linux
+        cpu_cores=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo "4")
+        total_memory_gb=$(($(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo "8388608") / 1024 / 1024))
+    fi
+
+    # Detect GPU count (if nvidia-smi is available)
+    if command -v nvidia-smi &> /dev/null; then
+        gpu_count=$(nvidia-smi --list-gpus 2>/dev/null | wc -l || echo "0")
+    fi
+
+    # Check if this is a remote/high-performance machine
+    # Check environment variable first
+    if [[ "${REMOTE_MACHINE}" == "true" ]] || [[ "${REMOTE_MACHINE}" == "1" ]]; then
+        is_remote=true
+    # Check hostname patterns (common remote machine patterns)
+    elif [[ -n "${HOSTNAME}" ]] && [[ "${HOSTNAME}" =~ ^(gpu|compute|node|server|remote|cluster|a100|h100|v100) ]]; then
+        is_remote=true
+    # Check if machine has high-end specs
+    elif [[ $cpu_cores -ge 32 ]] || [[ $total_memory_gb -ge 64 ]] || [[ $gpu_count -ge 2 ]]; then
+        is_remote=true
+    fi
+
+    # Set defaults based on machine type
+    if [[ "$is_remote" == "true" ]]; then
+        # High-performance remote machine: use larger values
+        DEFAULT_BATCH_SIZE=128
+        # For I/O-intensive tasks (image download), use more workers
+        # I/O operations spend most time waiting, so we can use many concurrent workers
+        if [[ $cpu_cores -ge 64 ]]; then
+            DEFAULT_NUM_WORKERS=128
+        elif [[ $cpu_cores -ge 32 ]]; then
+            DEFAULT_NUM_WORKERS=64
+        elif [[ $cpu_cores -ge 16 ]]; then
+            DEFAULT_NUM_WORKERS=32
+        else
+            DEFAULT_NUM_WORKERS=$((cpu_cores * 2))
+        fi
+        echo "Detected high-performance machine:"
+        echo "  CPU cores: ${cpu_cores}"
+        echo "  Memory: ${total_memory_gb} GB"
+        echo "  GPUs: ${gpu_count}"
+        echo "  Using batch_size=${DEFAULT_BATCH_SIZE}, num_workers=${DEFAULT_NUM_WORKERS} (I/O optimized)"
+    else
+        # Local machine: use conservative values
+        DEFAULT_BATCH_SIZE=32
+        # For local machines, still use more workers for I/O but cap it reasonably
+        DEFAULT_NUM_WORKERS=$((cpu_cores > 16 ? 16 : (cpu_cores > 0 ? cpu_cores * 2 : 8)))
+        echo "Detected local machine:"
+        echo "  CPU cores: ${cpu_cores}"
+        echo "  Memory: ${total_memory_gb} GB"
+        echo "  GPUs: ${gpu_count}"
+        echo "  Using batch_size=${DEFAULT_BATCH_SIZE}, num_workers=${DEFAULT_NUM_WORKERS} (I/O optimized)"
+    fi
+    echo ""
+}
+
+# Default parameters (will be auto-adjusted by detect_machine_type)
 DEFAULT_CACHE_DIR="${PWD}/data/coco/cache"
 DEFAULT_SPLITS=("train" "val")
 DEFAULT_TEACHER_MODEL="google/siglip2-base-patch16-224"
+# These will be set by detect_machine_type()
 DEFAULT_BATCH_SIZE=32
 DEFAULT_NUM_WORKERS=8
+
+# Auto-detect machine type and adjust defaults
+detect_machine_type
 
 # Parse arguments
 CACHE_DIR="${DEFAULT_CACHE_DIR}"
@@ -44,13 +125,21 @@ Options:
     --cache-dir DIR         Cache directory (default: ${DEFAULT_CACHE_DIR})
     --split SPLIT [SPLIT]   Dataset splits to download: train, val, test (default: train val)
     --teacher-model MODEL   Teacher model name (default: ${DEFAULT_TEACHER_MODEL})
-    --batch-size SIZE       Batch size for embedding extraction (default: ${DEFAULT_BATCH_SIZE})
+    --batch-size SIZE       Batch size for embedding extraction (auto-detected, can override)
     --max-samples N         Maximum number of samples to use (for small dataset, e.g., 1000 for local dev)
-    --num-workers N         Number of parallel workers for image download (default: ${DEFAULT_NUM_WORKERS})
+    --num-workers N         Number of parallel workers for image download (auto-detected, can override)
     --skip-download         Skip downloading COCO dataset
     --skip-embeddings       Skip extracting teacher embeddings
     --cleanup               Remove zip files after extraction
     -h, --help              Show this help message
+
+Auto-detection:
+    The script automatically detects machine type and sets optimal defaults:
+    - Local machines: batch_size=32, num_workers=16 (I/O optimized, scales with CPU cores)
+    - Remote/high-performance machines: batch_size=128, num_workers=64-128 (I/O optimized)
+    - Set REMOTE_MACHINE=true environment variable to force high-performance mode
+    - Detection is based on CPU cores, memory, GPU count, and hostname patterns
+    - num_workers is optimized for I/O-intensive image downloads (can use many concurrent workers)
 
 Examples:
     # Use all defaults (downloads train/val + extracts embeddings)

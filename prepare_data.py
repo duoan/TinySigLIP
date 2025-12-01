@@ -7,6 +7,7 @@ This script handles all data preparation steps:
 2. Download images (only the ones needed)
 3. Extract and cache teacher model embeddings
 4. Support small datasets for local development (e.g., 1K samples)
+5. Automatic multi-GPU support for faster embedding extraction
 
 Usage:
     python prepare_data.py --data-dir data/coco
@@ -20,6 +21,12 @@ Note: For faster downloads, install requests library:
 
 The script uses parallel downloads (default: 8 workers) which significantly speeds up
 image downloading compared to sequential downloads.
+
+Multi-GPU Support:
+    The script automatically detects and uses all available CUDA GPUs for embedding extraction.
+    Images are distributed across GPUs using round-robin scheduling for optimal load balancing.
+    If multiple GPUs are detected, the teacher model will be replicated to each GPU.
+
 """
 
 import argparse
@@ -40,6 +47,52 @@ def get_device():
         return torch.device("mps")
     else:
         return torch.device("cpu")
+
+
+def get_available_devices():
+    """
+    Get all available devices for computation.
+
+    Returns:
+        list: List of available devices. For CUDA, returns all available GPUs.
+              For MPS, returns single MPS device. For CPU, returns single CPU device.
+    """
+    devices = []
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        devices = [torch.device(f"cuda:{i}") for i in range(num_gpus)]
+        print(f"Detected {num_gpus} CUDA GPU(s): {[str(d) for d in devices]}")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        devices = [torch.device("mps")]
+        print("Detected MPS device")
+    else:
+        devices = [torch.device("cpu")]
+        print("Using CPU device")
+    return devices
+
+
+def get_device_info(device):
+    """
+    Get device information for logging purposes.
+
+    Args:
+        device: Device to get info for
+
+    Returns:
+        str: Device information string
+    """
+    if str(device).startswith("cuda") and device.index is not None:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                gpu_id = device.index
+                total_memory = torch.cuda.get_device_properties(gpu_id).total_memory
+                total_memory_gb = total_memory / (1024**3)
+                return f"GPU {gpu_id} ({total_memory_gb:.2f} GB)"
+        except Exception:
+            pass
+    return str(device)
 
 
 def download_image(url: str, filepath: Path, timeout: int = 10) -> bool:
@@ -239,7 +292,7 @@ def extract_teacher_embeddings(
     teacher_model,
     teacher_processor,
     hf_dataset,  # HuggingFace dataset
-    device,
+    devices,  # List of devices or single device
     teacher_model_name: str,
     split: str,
     max_samples: int | None = None,
@@ -259,11 +312,11 @@ def extract_teacher_embeddings(
         teacher_model: Teacher model instance (already loaded)
         teacher_processor: Teacher processor instance
         hf_dataset: HuggingFace dataset
-        device: Device to run on
+        devices: List of devices or single device to run on. If list, will distribute work across devices.
         teacher_model_name: Name/identifier of the teacher model (e.g., "google/siglip2-base-patch16-224")
         split: Dataset split ('train', 'val', etc.)
         max_samples: Maximum number of samples used (None for full dataset)
-        batch_size: Batch size for processing (not used for saving, just for reference)
+        batch_size: Batch size parameter (kept for compatibility, not actively used since COCO has max 4 captions)
         cache_dir: Base cache directory
         num_workers: Number of data loading workers (not used in this function)
     """
@@ -287,6 +340,28 @@ def extract_teacher_embeddings(
     import re
 
     from tqdm import tqdm
+
+    # Normalize devices to list
+    if not isinstance(devices, list):
+        devices = [devices]
+
+    num_devices = len(devices)
+    use_multi_gpu = num_devices > 1 and all(str(d).startswith("cuda") for d in devices)
+
+    if use_multi_gpu:
+        print(f"Using {num_devices} GPUs for parallel processing")
+        # Replicate model to all GPUs
+        teacher_models = {}
+        for device in devices:
+            teacher_models[device] = teacher_model.to(device)
+            teacher_models[device].eval()
+            print(f"  {get_device_info(device)}")
+    else:
+        # Single device: use the first device
+        device = devices[0]
+        teacher_model = teacher_model.to(device)
+        teacher_model.eval()
+        print(f"Using single device: {get_device_info(device)}")
 
     # Sanitize model name for filesystem (replace special chars with _)
     safe_model_name = re.sub(r"[^\w\-_]", "_", teacher_model_name).strip("_")
@@ -355,10 +430,17 @@ def extract_teacher_embeddings(
             padding="max_length",
             truncation=True,
         )
-        sample_images = sample_inputs["pixel_values"].to(device)
-        sample_text_ids = sample_inputs["input_ids"].to(device)
+        # Use first device for sample
+        sample_device = devices[0]
+        sample_images = sample_inputs["pixel_values"].to(sample_device)
+        sample_text_ids = sample_inputs["input_ids"].to(sample_device)
 
-        sample_outputs = teacher_model(
+        if use_multi_gpu:
+            sample_model = teacher_models[sample_device]
+        else:
+            sample_model = teacher_model
+
+        sample_outputs = sample_model(
             pixel_values=sample_images,
             input_ids=sample_text_ids,
             output_hidden_states=True,
@@ -366,7 +448,8 @@ def extract_teacher_embeddings(
         image_embed_dim = sample_outputs.image_embeds.shape[1]
         text_embed_dim = sample_outputs.text_embeds.shape[1]
         del sample_image, sample_inputs, sample_images, sample_text_ids, sample_outputs
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     print(f"  Image embed dim: {image_embed_dim}")
     print(f"  Text embed dim: {text_embed_dim}")
@@ -444,39 +527,47 @@ def extract_teacher_embeddings(
                 # COCO images are stored as: images/train/xxxx.jpg or images/val/xxxx.jpg
                 image_path = f"{split_name}/{image_filename}"
 
+                # Select device for this image (round-robin for multi-GPU)
+                if use_multi_gpu:
+                    current_device = devices[idx % num_devices]
+                    current_model = teacher_models[current_device]
+                else:
+                    current_device = device
+                    current_model = teacher_model
+
                 # Extract image embedding (only once per image)
                 image_tensor = teacher_processor.image_processor([image], return_tensors="pt")["pixel_values"].to(
-                    device
+                    current_device
                 )
 
                 # Get image features directly
-                image_emb = teacher_model.get_image_features(pixel_values=image_tensor)[0].detach().cpu()  # (D_proj,)
+                image_emb = current_model.get_image_features(pixel_values=image_tensor)[0].detach().cpu()  # (D_proj,)
 
-                # Process all captions for this image in batch
+                # Process all captions for this image (COCO has at most 4 captions per image)
                 caption_data_list = []
 
                 # Build sample_indices for all captions
                 for cap_idx in range(len(captions)):
                     sample_indices.append((image_id, cap_idx))
 
-                # Process all captions in batch
                 # Ensure captions are strings (not nested lists)
                 captions_clean = [str(cap) if not isinstance(cap, str) else cap for cap in captions]
 
-                # Use max_position_embeddings from config (loaded at function start)
+                # Use max_position_embeddings from config
                 max_length = max_position_embeddings
 
+                # Process all captions at once (max 4 captions, no need for batching)
                 caption_text_ids = teacher_processor.tokenizer(
                     captions_clean,
                     return_tensors="pt",
                     padding=True,
                     truncation=True,
                     max_length=max_length,
-                )["input_ids"].to(device)
+                )["input_ids"].to(current_device)
 
                 # Get text features directly
-                caption_embs = teacher_model.get_text_features(input_ids=caption_text_ids).detach().cpu()
-                # (batch_size, D_proj)
+                caption_embs = current_model.get_text_features(input_ids=caption_text_ids).detach().cpu()
+                # (num_captions, D_proj)
 
                 # Store caption data
                 for caption, caption_emb in zip(captions, caption_embs, strict=True):
@@ -754,12 +845,13 @@ Examples:
         try:
             from transformers import AutoModel, AutoProcessor
 
-            device = get_device()
-            print(f"Using device: {device}")
+            # Auto-detect available devices
+            devices = get_available_devices()
 
+            # Load model (will be replicated to multiple devices in extract_teacher_embeddings if multi-GPU)
             print(f"Loading teacher model: {args.teacher_model}")
-            teacher_model = AutoModel.from_pretrained(args.teacher_model).to(device)
-            teacher_model.eval()
+            teacher_model = AutoModel.from_pretrained(args.teacher_model)
+            # Don't move to device here - will be handled in extract_teacher_embeddings for multi-GPU support
 
             print(f"Loading teacher processor: {args.teacher_model}")
             teacher_processor = AutoProcessor.from_pretrained(args.teacher_model)
@@ -777,7 +869,7 @@ Examples:
                 teacher_model=teacher_model,
                 teacher_processor=teacher_processor,
                 hf_dataset=dataset,  # HuggingFace dataset
-                device=device,
+                devices=devices,  # List of devices for multi-GPU support
                 teacher_model_name=args.teacher_model,
                 split=args.split,
                 max_samples=args.max_samples,
