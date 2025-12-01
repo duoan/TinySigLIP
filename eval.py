@@ -101,6 +101,7 @@ def evaluate_retrieval_coco(
     logit_scale: float | None = None,
     k_values=(1, 5, 10),
     max_samples: int | None = None,
+    evaluate_teacher: bool = True,
 ):
     """
     Evaluate image-text retrieval on COCO validation set.
@@ -117,7 +118,9 @@ def evaluate_retrieval_coco(
         max_samples: Maximum number of samples to evaluate (None for all)
 
     Returns:
-        dict: Retrieval metrics
+        dict: Retrieval metrics. Keys:
+            - i2t_recall@K / t2i_recall@K for student model
+            - teacher_i2t_recall@K / teacher_t2i_recall@K if evaluate_teacher=True
     """
     # Create dataset
     print(f"Loading dataset from cache: {dataset_path}")
@@ -153,11 +156,19 @@ def evaluate_retrieval_coco(
     all_text_features_list = []
     image_to_texts = {}  # Map unique image index to list of text indices
 
+    # Optional: teacher features from cached embeddings (no teacher model needed)
+    teacher_image_features_list = []
+    teacher_text_features_list = []
+    teacher_image_to_texts = {}  # Map unique teacher image index to list of text indices
+    teacher_image_idx_map: dict[int, int] = {}  # image_id -> unique index
+
     print("Extracting features from dataset...")
     text_idx = 0
     last_image_feat = None
     unique_image_idx = -1
     similarity_threshold = 0.999  # Threshold for considering images as the same
+
+    teacher_text_idx = 0
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Extracting features"):
@@ -173,7 +184,8 @@ def evaluate_retrieval_coco(
                 image = images[i : i + 1]
                 text_id = text_ids_batch[i : i + 1]
 
-                # Extract image and text features
+                # ===== Student features =====
+                # Extract image and text features from student model
                 image_feat, text_feat = model(image, text_id)
                 image_feat = F.normalize(image_feat, dim=-1)
                 text_feat = F.normalize(text_feat, dim=-1)
@@ -200,26 +212,53 @@ def evaluate_retrieval_coco(
                 image_to_texts[unique_image_idx].append(text_idx)
                 text_idx += 1
 
+                # ===== Teacher features from cache (optional) =====
+                if evaluate_teacher:
+                    # Cached embeddings are per (image, caption) pair
+                    # Use image_ids to deduplicate images across captions
+                    image_id = batch["image_ids"][i]
+                    # image_id comes from JSON / pickle, ensure it's int
+                    image_id_int = int(image_id)
+
+                    teacher_img = batch["teacher_image_embeds"][i].unsqueeze(0)
+                    teacher_txt = batch["teacher_text_embeds"][i].unsqueeze(0)
+
+                    teacher_img = F.normalize(teacher_img, dim=-1)
+                    teacher_txt = F.normalize(teacher_txt, dim=-1)
+
+                    # Create unique image index per image_id
+                    if image_id_int not in teacher_image_idx_map:
+                        t_unique_idx = len(teacher_image_features_list)
+                        teacher_image_idx_map[image_id_int] = t_unique_idx
+                        teacher_image_features_list.append(teacher_img.cpu())
+                        teacher_image_to_texts[t_unique_idx] = []
+
+                    t_img_idx = teacher_image_idx_map[image_id_int]
+                    teacher_image_to_texts[t_img_idx].append(teacher_text_idx)
+                    teacher_text_idx += 1
+
+                    teacher_text_features_list.append(teacher_txt.cpu())
+
                 if max_samples and text_idx >= max_samples:
                     break
 
             if max_samples and text_idx >= max_samples:
                 break
 
-    # Concatenate all features
+    # Concatenate all student features
     all_image_features = torch.cat(all_image_features_list, dim=0).to(device)  # (N_unique_images, D)
     all_text_features = torch.cat(all_text_features_list, dim=0).to(device)  # (N_texts, D)
 
-    print(f"\nTotal unique images: {len(all_image_features)}")
-    print(f"Total text captions: {len(all_text_features)}")
-    print(f"Average captions per image: {len(all_text_features) / len(all_image_features):.2f}")
+    print(f"\n[Student] Total unique images: {len(all_image_features)}")
+    print(f"[Student] Total text captions: {len(all_text_features)}")
+    print(f"[Student] Average captions per image: {len(all_text_features) / len(all_image_features):.2f}")
 
     # Use logit scale from checkpoint if available
     if logit_scale is None:
         logit_scale = 1.0
 
-    # Compute similarity matrix
-    print("\nComputing similarity matrix...")
+    # Compute similarity matrix for student model
+    print("\nComputing similarity matrix for student model...")
     with torch.no_grad():
         # Image-to-text: (N_images, N_texts)
         logits_i2t = logit_scale * all_image_features @ all_text_features.T
@@ -227,15 +266,44 @@ def evaluate_retrieval_coco(
         # Text-to-image: (N_texts, N_images)
         logits_t2i = logits_i2t.T
 
-    # Compute Recall@K for image-to-text retrieval
-    print("\nComputing image-to-text retrieval metrics...")
+    # Compute Recall@K for image-to-text retrieval (student)
+    print("\nComputing image-to-text retrieval metrics for student...")
     i2t_results = compute_recall_at_k_coco(logits_i2t, image_to_texts, k_values, "i2t")
 
-    # Compute Recall@K for text-to-image retrieval
-    print("Computing text-to-image retrieval metrics...")
+    # Compute Recall@K for text-to-image retrieval (student)
+    print("Computing text-to-image retrieval metrics for student...")
     t2i_results = compute_recall_at_k_coco(logits_t2i, image_to_texts, k_values, "t2i", reverse=True)
 
     results = {**i2t_results, **t2i_results}
+
+    # ===== Optional: teacher metrics using cached embeddings =====
+    if evaluate_teacher and teacher_image_features_list and teacher_text_features_list:
+        teacher_image_features = torch.cat(teacher_image_features_list, dim=0).to(device)
+        teacher_text_features = torch.cat(teacher_text_features_list, dim=0).to(device)
+
+        print(f"\n[Teacher] Total unique images: {len(teacher_image_features)}")
+        print(f"[Teacher] Total text captions: {len(teacher_text_features)}")
+        print(f"[Teacher] Average captions per image: {len(teacher_text_features) / len(teacher_image_features):.2f}")
+
+        # For teacher we use pure cosine similarity (logit_scale = 1.0),
+        # matching the typical evaluation for frozen encoders.
+        print("\nComputing similarity matrix for teacher model (cached embeddings)...")
+        with torch.no_grad():
+            teacher_logits_i2t = teacher_image_features @ teacher_text_features.T
+            teacher_logits_t2i = teacher_logits_i2t.T
+
+        print("\nComputing image-to-text retrieval metrics for teacher...")
+        teacher_i2t_results = compute_recall_at_k_coco(
+            teacher_logits_i2t, teacher_image_to_texts, k_values, "teacher_i2t"
+        )
+
+        print("Computing text-to-image retrieval metrics for teacher...")
+        teacher_t2i_results = compute_recall_at_k_coco(
+            teacher_logits_t2i, teacher_image_to_texts, k_values, "teacher_t2i", reverse=True
+        )
+
+        results.update(teacher_i2t_results)
+        results.update(teacher_t2i_results)
 
     return results
 
@@ -406,6 +474,11 @@ def main():
             "Only used if --dataset-path is not provided."
         ),
     )
+    parser.add_argument(
+        "--skip-teacher",
+        action="store_true",
+        help="Skip evaluation of teacher (cached) embeddings and only evaluate the student model",
+    )
 
     args = parser.parse_args()
 
@@ -490,22 +563,42 @@ def main():
         device=args.device,
         logit_scale=logit_scale,
         max_samples=args.max_samples,
+        evaluate_teacher=not args.skip_teacher,
     )
 
     if results:
         print("\n" + "=" * 60)
         print("COCO Image-Text Retrieval Results:")
         print("=" * 60)
-        print("Image-to-Text Retrieval:")
+
+        # Teacher results (if available)
+        has_teacher = any(key.startswith("teacher_") for key in results.keys())
+        if has_teacher:
+            print("Teacher (cached SigLIP) Image-to-Text Retrieval:")
+            for k in [1, 5, 10]:
+                key = f"teacher_i2t_recall@{k}"
+                if key in results:
+                    print(f"  Recall@{k}: {results[key]:.2f}%")
+            print("\nTeacher (cached SigLIP) Text-to-Image Retrieval:")
+            for k in [1, 5, 10]:
+                key = f"teacher_t2i_recall@{k}"
+                if key in results:
+                    print(f"  Recall@{k}: {results[key]:.2f}%")
+            print("\n" + "-" * 60)
+
+        # Student (TinySigLIP) results
+        print("Student (TinySigLIP) Image-to-Text Retrieval:")
         for k in [1, 5, 10]:
             key = f"i2t_recall@{k}"
             if key in results:
                 print(f"  Recall@{k}: {results[key]:.2f}%")
-        print("\nText-to-Image Retrieval:")
+
+        print("\nStudent (TinySigLIP) Text-to-Image Retrieval:")
         for k in [1, 5, 10]:
             key = f"t2i_recall@{k}"
             if key in results:
-                print(f"  Recall@{k}: {results[key]:.2f}%")
+                print(f"  Recall@{k}: {results[key]:{'.2f'}%}")
+
         print("=" * 60 + "\n")
         print("Evaluation completed successfully!")
 
