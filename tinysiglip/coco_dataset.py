@@ -83,7 +83,44 @@ class COCOCaptionDataset(Dataset):
             self.sample_indices = pickle.load(f)
 
         # Cache for loaded batch files: {batch_idx: batch_data}
-        self.teacher_cache_batches = {}
+        self.teacher_cache_batches: dict[int, dict] = {}
+
+        # ===== Teacher batch file prefetch / buffer =====
+        # We maintain a small rolling buffer of teacher batch files in memory
+        # so that __getitem__ does not frequently block on torch.load.
+        #
+        # Design:
+        # - self._all_teacher_batch_indices: sorted list of all unique batch_idx
+        # - self._teacher_prefetch_size: desired buffer size (default: 4)
+        # - self._teacher_prefetch_cursor: pointer into _all_teacher_batch_indices
+        #
+        # In __init__, we:
+        #   * pre-load the first N batch files (startup warm cache)
+        #   * set the cursor to N
+        # In __getitem__, after loading the batch for the requested image,
+        #   * we call _maintain_teacher_cache() to:
+        #       - evict oldest entries if cache > N
+        #       - preload new batch files while cache < N (if there are any left)
+        self._teacher_prefetch_size = 4
+        self._all_teacher_batch_indices = sorted({int(batch_idx) for batch_idx, _ in self.image_index.values()})
+        self._teacher_prefetch_cursor = 0
+
+        # Only prefetch if there are any batch files at all
+        if self._teacher_prefetch_size > 0 and self._all_teacher_batch_indices:
+            num_to_prefetch = min(self._teacher_prefetch_size, len(self._all_teacher_batch_indices))
+            for prefetch_batch_idx in self._all_teacher_batch_indices[:num_to_prefetch]:
+                # Use the same loader + in-memory cache so we don't duplicate logic
+                # or accidentally load the same file twice.
+                self._load_teacher_batch(prefetch_batch_idx)
+
+            # Advance cursor past the prefetched window
+            self._teacher_prefetch_cursor = num_to_prefetch
+
+            if verbose:
+                print(
+                    f"  - Prefetched {num_to_prefetch} teacher batch files into memory "
+                    f"(buffer size={self._teacher_prefetch_size})"
+                )
 
         # Validate processor
         if processor is None:
@@ -112,6 +149,38 @@ class COCOCaptionDataset(Dataset):
         batch_data = torch.load(batch_file, map_location="cpu")
         self.teacher_cache_batches[batch_idx] = batch_data
         return batch_data
+
+    def _maintain_teacher_cache(self) -> None:
+        """
+        Maintain a rolling buffer of teacher batch files in memory.
+
+        Goals:
+        - Keep at most self._teacher_prefetch_size batch files in memory
+        - Try to keep at least self._teacher_prefetch_size batch files loaded
+          (if there are that many unique batch indices available)
+
+        Strategy:
+        - Evict oldest entries first (dict preserves insertion order on 3.7+)
+        - Prefetch new batch files in the order of self._all_teacher_batch_indices
+        """
+        # Nothing to do if prefetch size is disabled
+        if self._teacher_prefetch_size <= 0:
+            return
+
+        # Evict oldest entries if cache is larger than desired buffer size
+        while len(self.teacher_cache_batches) > self._teacher_prefetch_size:
+            oldest_key = next(iter(self.teacher_cache_batches))
+            del self.teacher_cache_batches[oldest_key]
+
+        # Prefetch new batch files while cache is smaller than desired size
+        # and we still have unseen batch indices.
+        while len(self.teacher_cache_batches) < self._teacher_prefetch_size and self._teacher_prefetch_cursor < len(
+            self._all_teacher_batch_indices
+        ):
+            next_batch_idx = self._all_teacher_batch_indices[self._teacher_prefetch_cursor]
+            self._teacher_prefetch_cursor += 1
+            # This will populate teacher_cache_batches if not already present
+            self._load_teacher_batch(next_batch_idx)
 
     def _load_image_from_path(self, image_path: str) -> Image.Image:
         """Load image from file path (relative to images directory)."""
@@ -171,6 +240,11 @@ class COCOCaptionDataset(Dataset):
 
         batch_file_idx, local_idx = self.image_index[image_id]
         batch_data = self._load_teacher_batch(batch_file_idx)
+
+        # After we've loaded the current batch file, update the rolling
+        # teacher cache so that we keep a small number of batch files
+        # pre-loaded in memory (and evict old ones if needed).
+        self._maintain_teacher_cache()
 
         if local_idx not in batch_data:
             raise IndexError(f"Local index {local_idx} not found in batch {batch_file_idx}")
