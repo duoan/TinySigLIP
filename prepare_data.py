@@ -430,15 +430,14 @@ def extract_teacher_embeddings(
             padding="max_length",
             truncation=True,
         )
-        # Use first device for sample
+        # Use first device for sample (ensure model and tensors are on the same device)
         sample_device = devices[0]
         sample_images = sample_inputs["pixel_values"].to(sample_device)
         sample_text_ids = sample_inputs["input_ids"].to(sample_device)
 
-        if use_multi_gpu:
-            sample_model = teacher_models[sample_device]
-        else:
-            sample_model = teacher_model
+        # Always move the base teacher_model to the sample_device to avoid
+        # potential device mismatch errors (e.g., weights on cuda:7, inputs on cuda:0)
+        sample_model = teacher_model.to(sample_device)
 
         sample_outputs = sample_model(
             pixel_values=sample_images,
