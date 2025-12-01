@@ -7,7 +7,7 @@ This script handles all data preparation steps:
 2. Download images (only the ones needed)
 3. Extract and cache teacher model embeddings
 4. Support small datasets for local development (e.g., 1K samples)
-5. Automatic multi-GPU support for faster embedding extraction
+5. Robust single-GPU teacher embedding extraction (use CUDA_VISIBLE_DEVICES to pick GPU)
 
 Usage:
     python prepare_data.py --data-dir data/coco
@@ -22,10 +22,11 @@ Note: For faster downloads, install requests library:
 The script uses parallel downloads (default: 8 workers) which significantly speeds up
 image downloading compared to sequential downloads.
 
-Multi-GPU Support:
-    The script automatically detects and uses all available CUDA GPUs for embedding extraction.
-    Images are distributed across GPUs using round-robin scheduling for optimal load balancing.
-    If multiple GPUs are detected, the teacher model will be replicated to each GPU.
+GPU Usage:
+    The script automatically detects CUDA and uses a single GPU (typically cuda:0)
+    for teacher embedding extraction. You can control which GPU is used via
+    CUDA_VISIBLE_DEVICES. Multi-GPU training is supported elsewhere; this script
+    focuses on robust single-GPU offline preprocessing.
 
 """
 
@@ -345,23 +346,26 @@ def extract_teacher_embeddings(
     if not isinstance(devices, list):
         devices = [devices]
 
-    num_devices = len(devices)
-    use_multi_gpu = num_devices > 1 and all(str(d).startswith("cuda") for d in devices)
+    # IMPORTANT:
+    # For now, we disable true multi-GPU inside this data-prep script because
+    # naive replication of HuggingFace models across many devices is easy to
+    # get wrong and leads to hard-to-debug device mismatch errors
+    # (weights and inputs ending up on different GPUs).
+    #
+    # Instead, we always use a SINGLE device (typically cuda:0) here.
+    # This keeps the logic simple and robust, and you still get full
+    # utilization of one strong GPU. If you want real multi-GPU speedup,
+    # it's better handled at the training stage rather than in this
+    # one-off embedding extraction script.
+    devices = [devices[0]]
+    num_devices = 1
+    use_multi_gpu = False
 
-    if use_multi_gpu:
-        print(f"Using {num_devices} GPUs for parallel processing")
-        # Replicate model to all GPUs
-        teacher_models = {}
-        for device in devices:
-            teacher_models[device] = teacher_model.to(device)
-            teacher_models[device].eval()
-            print(f"  {get_device_info(device)}")
-    else:
-        # Single device: use the first device
-        device = devices[0]
-        teacher_model = teacher_model.to(device)
-        teacher_model.eval()
-        print(f"Using single device: {get_device_info(device)}")
+    # Single device: use the first device
+    device = devices[0]
+    teacher_model = teacher_model.to(device)
+    teacher_model.eval()
+    print(f"Using single device for teacher embeddings: {get_device_info(device)}")
 
     # Sanitize model name for filesystem (replace special chars with _)
     safe_model_name = re.sub(r"[^\w\-_]", "_", teacher_model_name).strip("_")
@@ -504,9 +508,11 @@ def extract_teacher_embeddings(
                 device_batches[device_idx].append(item)
 
             # Process each device batch
-            for device_idx, items in device_batches.items():
-                current_device = devices[device_idx] if use_multi_gpu else devices[0]
-                current_model = teacher_models[current_device] if use_multi_gpu else teacher_model
+            # NOTE: we currently force single-device execution above, so
+            # this will always run on devices[0] with the single teacher_model.
+            for _, items in device_batches.items():
+                current_device = devices[0]
+                current_model = teacher_model
 
                 # Extract images and prepare batch
                 batch_images = [item[4] for item in items]  # Extract images

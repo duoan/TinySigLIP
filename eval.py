@@ -7,16 +7,17 @@ batch-internal evaluation during training, which only searches within a small ba
 """
 
 import argparse
+import re
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from transformers import AutoProcessor
 
 from tinysiglip.coco_dataset import COCOCaptionDataset, collate_coco_batch
 from tinysiglip.model import TinySiglipConfig, TinySiglipModel
-from tinysiglip.processor import TinySiglipProcessor
 
 
 def load_checkpoint(checkpoint_path: str, device: str = "cuda"):
@@ -61,7 +62,7 @@ def load_processor_from_checkpoint(checkpoint_dir: Path):
     processor_path = checkpoint_dir / "processor"
     if processor_path.exists():
         try:
-            processor = TinySiglipProcessor.from_pretrained(str(processor_path))
+            processor = AutoProcessor.from_pretrained(str(processor_path))
             return processor
         except Exception as e:
             print(f"Warning: Could not load processor from checkpoint: {e}")
@@ -71,38 +72,28 @@ def load_processor_from_checkpoint(checkpoint_dir: Path):
 
 def create_processor_from_config(config, device: str = "cuda"):
     """Create processor from config."""
-    from transformers import AutoImageProcessor, AutoTokenizer
+    config_dict = config.get("config", config) if isinstance(config, dict) and "config" in config else config
+    teacher_cfg = config_dict.get("teacher", {})
+    student_cfg = config_dict.get("student", {})
 
-    student_cfg = config.get("student", {})
-    training_cfg = config.get("training", {})
+    # Get teacher model name from config (preferred) or use student tokenizer name as fallback
+    teacher_model_name = teacher_cfg.get("model_name", None)
+    tokenizer_name = student_cfg.get("tokenizer_name", None)
 
-    tokenizer_name = student_cfg.get("tokenizer_name", "google/siglip-base-patch16-224")
+    # Prefer teacher model name, fallback to tokenizer name, then default
+    model_name = teacher_model_name or tokenizer_name or "google/siglip-base-patch16-224"
+
     try:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        processor = AutoProcessor.from_pretrained(model_name)
+        return processor
     except Exception as e:
-        print(f"Warning: Could not load tokenizer {tokenizer_name}: {e}")
+        print(f"Warning: Could not load processor from {model_name}: {e}")
         return None
-
-    try:
-        image_processor = AutoImageProcessor.from_pretrained(tokenizer_name)
-    except Exception as e:
-        print(f"Warning: Could not load image processor: {e}")
-        image_processor = None
-
-    processor = TinySiglipProcessor(
-        tokenizer=tokenizer,
-        image_processor=image_processor,
-        image_size=training_cfg.get("image_size", 224),
-        max_seq_len=training_cfg.get("text_seq_len", 64),
-        use_augmentation=False,  # No augmentation for evaluation
-    )
-
-    return processor
 
 
 def evaluate_retrieval_coco(
     model: TinySiglipModel,
-    processor: TinySiglipProcessor,
+    processor,  # AutoProcessor instance
     dataset_path: str,  # Path to cached embeddings directory
     batch_size: int = 32,
     num_workers: int = 4,
@@ -116,13 +107,12 @@ def evaluate_retrieval_coco(
 
     Args:
         model: TinySiglipModel instance
-        processor: TinySiglipProcessor instance
-        split: Dataset split ('val' or 'test')
+        processor: AutoProcessor instance
+        dataset_path: Path to cached embeddings directory
         batch_size: Batch size for evaluation
         num_workers: Number of data loading workers
         device: Device to run evaluation on
         logit_scale: Optional logit scale (temperature). If None, uses default 1.0
-        cache_dir: Directory to cache the dataset
         k_values: K values for Recall@K
         max_samples: Maximum number of samples to evaluate (None for all)
 
@@ -131,7 +121,10 @@ def evaluate_retrieval_coco(
     """
     # Create dataset
     print(f"Loading dataset from cache: {dataset_path}")
-    max_seq_len = processor.max_seq_len if hasattr(processor, "max_seq_len") else 64
+    # Get max_seq_len from tokenizer or use default
+    max_seq_len = getattr(processor.tokenizer, "model_max_length", 64)
+    if max_seq_len is None or max_seq_len == 1e30:  # Some tokenizers return this as default
+        max_seq_len = 64
 
     dataset = COCOCaptionDataset(
         dataset_path=dataset_path,
@@ -298,6 +291,58 @@ def compute_recall_at_k_coco(logits, image_to_texts, k_values, prefix="", revers
     return results
 
 
+def auto_detect_dataset_path(checkpoint, split: str, cache_dir: str | None = None) -> str | None:
+    """
+    Auto-detect dataset path from checkpoint config and cache directory.
+
+    Args:
+        checkpoint: Checkpoint dictionary containing config
+        split: Dataset split ('val' or 'test')
+        cache_dir: Base cache directory (default: "data/coco/cache")
+
+    Returns:
+        Detected dataset path or None if not found
+    """
+    project_root = Path(__file__).parent.resolve()
+
+    # Default cache directory
+    if cache_dir is None:
+        cache_dir = "data/coco/cache"
+
+    cache_base_dir = Path(cache_dir)
+    if not cache_base_dir.is_absolute():
+        cache_base_dir = project_root / cache_base_dir
+
+    # Get teacher model name from checkpoint config
+    config = checkpoint.get("config", {})
+    teacher_cfg = config.get("teacher", {})
+    teacher_model_name = teacher_cfg.get("model_name", "google/siglip2-base-patch16-224")
+
+    # Sanitize model name for filesystem
+    safe_model_name = re.sub(r"[^\w\-_]", "_", teacher_model_name).strip("_")
+
+    # Try different dataset sizes (tiny, medium, large)
+    # For each size, try the requested split first, then fall back to other common splits
+    splits_to_try = [split] + [s for s in ["train", "val", "test"] if s != split]
+
+    for dataset_size_name in ["tiny", "medium", "large"]:
+        for split_name in splits_to_try:
+            cache_path_candidate = cache_base_dir / safe_model_name / dataset_size_name / split_name
+            metadata_file = cache_path_candidate / "metadata.json"
+            if metadata_file.exists():
+                dataset_path = str(cache_path_candidate)
+                if split_name != split:
+                    print(
+                        f"⚠ Warning: Requested split '{split}' but found cache for "
+                        f"'{split_name}'. Using: {dataset_path}"
+                    )
+                else:
+                    print(f"✓ Auto-detected dataset path: {dataset_path}")
+                return dataset_path
+
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate TinySigLIP on COCO image-text retrieval")
     parser.add_argument(
@@ -343,6 +388,24 @@ def main():
         default=None,
         help="Maximum number of samples to evaluate (default: None for all)",
     )
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default=None,
+        help=(
+            "Path to cached embeddings directory. If None, will try to auto-detect "
+            "based on checkpoint config and split."
+        ),
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=None,
+        help=(
+            "Base cache directory for auto-detection (default: data/coco/cache). "
+            "Only used if --dataset-path is not provided."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -371,10 +434,47 @@ def main():
     if processor is None:
         print("Creating processor from config...")
         config = checkpoint.get("config", {})
-        processor = create_processor_from_config(config, device=args.device)
+        # Try to get teacher model name from config
+        teacher_cfg = config.get("teacher", {})
+        teacher_model_name = teacher_cfg.get("model_name", None)
+
+        if teacher_model_name:
+            try:
+                processor = AutoProcessor.from_pretrained(teacher_model_name)
+                print(f"✓ Loaded processor from teacher model: {teacher_model_name}")
+            except Exception as e:
+                print(f"Warning: Could not load processor from {teacher_model_name}: {e}")
+                processor = create_processor_from_config(config, device=args.device)
+        else:
+            processor = create_processor_from_config(config, device=args.device)
 
     if processor is None:
         raise ValueError("Could not load or create processor. Please check checkpoint and config.")
+
+    # Determine dataset path
+    dataset_path = args.dataset_path
+    if dataset_path is None:
+        # Try to auto-detect from checkpoint config
+        print("Auto-detecting dataset path from checkpoint config...")
+        dataset_path = auto_detect_dataset_path(checkpoint, args.split, args.cache_dir)
+        if dataset_path is None:
+            raise ValueError(
+                f"Could not auto-detect dataset path for split '{args.split}'. "
+                "Please specify --dataset-path explicitly. "
+                "Expected format: data/coco/cache/model_name/dataset_size/split"
+            )
+    else:
+        # Convert to absolute path if relative
+        if not Path(dataset_path).is_absolute():
+            project_root = Path(__file__).parent.resolve()
+            dataset_path = str(project_root / dataset_path)
+
+    # Validate dataset path
+    metadata_file = Path(dataset_path) / "metadata.json"
+    if not metadata_file.exists():
+        raise FileNotFoundError(
+            f"Dataset cache not found: {dataset_path}\nPlease run prepare_data.py first to generate the cache."
+        )
 
     # Evaluate
     print("\n" + "=" * 60)
@@ -384,7 +484,7 @@ def main():
     results = evaluate_retrieval_coco(
         model=model,
         processor=processor,
-        dataset_path=args.dataset_path,
+        dataset_path=dataset_path,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         device=args.device,
