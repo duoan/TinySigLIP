@@ -6,6 +6,7 @@ No dependency on torchvision CocoCaptions.
 
 import json
 import pickle
+from collections import OrderedDict
 from pathlib import Path
 
 import torch
@@ -82,6 +83,15 @@ class COCOCaptionDataset(Dataset):
         with open(sample_indices_file, "rb") as f:
             self.sample_indices = pickle.load(f)
 
+        # Small in-memory cache for teacher batch files to avoid repeatedly
+        # loading the same huge .pt file from disk for every sample.
+        # This trades a bit of RAM for a big speed‑up on spinning disks / network FS.
+        # Each entry is: batch_idx -> dict[local_idx, (image_id, image_path, image_emb, caption_data_list)]
+        self._batch_cache: OrderedDict[int, dict] = OrderedDict()
+        # Number of batch files to keep in memory per Dataset instance / DataLoader worker
+        # 3–8 is usually a good trade‑off; each batch file size is controlled by images_per_batch in prepare_data.py
+        self._max_cached_batches: int = 4
+
         # Validate processor
         if processor is None:
             raise ValueError("processor must be provided (use AutoProcessor)")
@@ -98,12 +108,27 @@ class COCOCaptionDataset(Dataset):
             print(f"  - Images directory: {self.images_dir}")
 
     def _load_teacher_batch(self, batch_idx: int) -> dict:
-        """Load a batch file from teacher cache directory (no in-memory cache)."""
+        """Load a batch file from teacher cache directory with a small LRU in‑memory cache."""
         batch_file = self.dataset_path / f"batch_{batch_idx:06d}.pt"
         if not batch_file.exists():
             raise FileNotFoundError(f"Batch file not found: {batch_file}")
 
-        return torch.load(batch_file, map_location="cpu")
+        # Fast path: served from in‑memory cache (per worker)
+        if batch_idx in self._batch_cache:
+            batch_data = self._batch_cache.pop(batch_idx)  # refresh LRU order
+            self._batch_cache[batch_idx] = batch_data
+            return batch_data
+
+        # Slow path: load from disk once, then cache
+        batch_data = torch.load(batch_file, map_location="cpu")
+        self._batch_cache[batch_idx] = batch_data
+
+        # Enforce simple LRU eviction to cap memory usage
+        if len(self._batch_cache) > self._max_cached_batches:
+            # pop the oldest inserted item
+            self._batch_cache.popitem(last=False)
+
+        return batch_data
 
     def _load_image_from_path(self, image_path: str) -> Image.Image:
         """Load image from file path (relative to images directory)."""

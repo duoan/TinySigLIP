@@ -389,7 +389,7 @@ def extract_teacher_embeddings(
     cache_dir: Path | str | None = None,
     num_workers: int = 4,
     image_size: int | None = None,
-    images_per_batch: int = 2000,
+    images_per_batch: int = 200,
 ):
     """
     Extract teacher embeddings grouped by image_id.
