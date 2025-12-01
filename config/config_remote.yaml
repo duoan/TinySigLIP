@@ -23,3 +23,5 @@ dataset:
 # Early stopping configuration overrides for remote training
 early_stopping:
   patience: 100  # More patience for remote training (100 steps)
+  monitor: "student_i2t_recall@1"  # Monitor image-to-text recall at 1
+  mode: "max"  # Maximize image-to-text recall at 1 (higher is better)

@@ -27,9 +27,9 @@ training:
 
 # Loss configuration
 loss:
-  lambda_siglip: 0.5
-  lambda_cmd: 1.0
-  lambda_umd: 1.0
+  lambda_siglip: 1.0
+  lambda_cmd: 100.0
+  lambda_umd: 50.0
   temperature: 3.0
 
 # Dataset configuration
@@ -42,6 +42,10 @@ dataset:
   num_workers: 4  # Number of data loading workers (can be >0 for non-streaming Dataset)
   coco_root: "data/coco/images"  # Root directory where COCO images are stored (default: relative to project root)
   coco_ann_file: "data/coco/annotations/captions_train2017.json"  # Path to COCO annotation JSON file (default: relative to project root)
+  dataset_path: null  # Path to cached embeddings directory. If None, will try to auto-detect based on teacher model, dataset size, and split.
+                             # New format: cache_dir/model_name/dataset_size/split/ (e.g., "data/coco/cache/google_siglip2-base-patch16-224/tiny/train")
+                             # If None and cache_dir is set, will auto-detect cache path. Otherwise, teacher embeddings are computed on-the-fly.
+                             # Use prepare_data.py to generate the cache first.
 
 # Embedding configuration
 embedding:

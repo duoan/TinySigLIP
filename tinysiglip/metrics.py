@@ -38,9 +38,7 @@ def compute_recall_at_k(logits_per_image, k_values=(1, 5, 10)):
     return results
 
 
-def compute_retrieval_metrics(
-    image_features, text_features, logit_scale, prefix=""
-):
+def compute_retrieval_metrics(image_features, text_features, logit_scale, logit_bias=0.0, prefix=""):
     """
     Compute retrieval metrics for both image-to-text and text-to-image.
 
@@ -48,6 +46,7 @@ def compute_retrieval_metrics(
         image_features: (B, D) normalized image features
         text_features: (B, D) normalized text features
         logit_scale: scalar temperature scale
+        logit_bias: scalar bias term (default: 0.0)
         prefix: prefix for metric names (e.g., "student_", "teacher_")
 
     Returns:
@@ -58,7 +57,7 @@ def compute_retrieval_metrics(
     text_features = F.normalize(text_features, dim=-1)
 
     # Compute similarity matrices
-    logits_per_image = logit_scale * image_features @ text_features.T  # (B, B)
+    logits_per_image = logit_scale * image_features @ text_features.T + logit_bias  # (B, B)
     logits_per_text = logits_per_image.T  # (B, B)
 
     # Image-to-text retrieval
@@ -123,29 +122,23 @@ def compute_evaluation_metrics(
     student_text_features,
     teacher_image_features,
     teacher_text_features,
-    logit_scale,
-    projection_v=None,
-    projection_t=None,
-    student_vision_raw=None,
-    student_text_raw=None,
-    teacher_vision_raw=None,
-    teacher_text_raw=None,
+    student_logit_scale,
+    student_logit_bias,
+    teacher_logit_scale,
+    teacher_logit_bias,
 ):
     """
     Compute comprehensive evaluation metrics during training.
 
     Args:
-        student_image_features: (B, D_s) student image features (projected)
-        student_text_features: (B, D_s) student text features (projected)
-        teacher_image_features: (B, D_t) teacher image features (projected)
-        teacher_text_features: (B, D_t) teacher text features (projected)
-        logit_scale: scalar temperature scale
-        projection_v: Optional projection layer for vision features
-        projection_t: Optional projection layer for text features
-        student_vision_raw: Optional raw student vision features (before projection)
-        student_text_raw: Optional raw student text features (before projection)
-        teacher_vision_raw: Optional raw teacher vision features (before projection)
-        teacher_text_raw: Optional raw teacher text features (before projection)
+        student_image_features: (B, D_s) student image features
+        student_text_features: (B, D_s) student text features
+        teacher_image_features: (B, D_t) teacher image features
+        teacher_text_features: (B, D_t) teacher text features
+        student_logit_scale: scalar temperature scale
+        student_logit_bias: scalar bias term
+        teacher_logit_scale: scalar temperature scale
+        teacher_logit_bias: scalar bias term
 
     Returns:
         dict: comprehensive metrics dictionary
@@ -154,60 +147,31 @@ def compute_evaluation_metrics(
 
     # 1. Student retrieval metrics
     student_metrics = compute_retrieval_metrics(
-        student_image_features, student_text_features, logit_scale, prefix="student_"
+        student_image_features, student_text_features, student_logit_scale, student_logit_bias, prefix="student_"
     )
     metrics.update(student_metrics)
 
     # 2. Teacher retrieval metrics (for reference)
     teacher_metrics = compute_retrieval_metrics(
-        teacher_image_features, teacher_text_features, logit_scale, prefix="teacher_"
+        teacher_image_features, teacher_text_features, teacher_logit_scale, teacher_logit_bias, prefix="teacher_"
     )
     metrics.update(teacher_metrics)
 
     # 3. Feature similarity (student vs teacher)
-    # Use raw features with projections if available for more accurate comparison
-    if (
-        projection_v is not None
-        and student_vision_raw is not None
-        and teacher_vision_raw is not None
-    ):
-        # Project student raw features to teacher dimension
-        student_vision_proj = projection_v(student_vision_raw)
-        student_vision_proj_norm = F.normalize(student_vision_proj, dim=-1)
-        teacher_vision_raw_norm = F.normalize(teacher_vision_raw, dim=-1)
-        image_sim = compute_feature_similarity(
-            student_vision_proj_norm, teacher_vision_raw_norm, prefix="image_sim_"
-        )
-    else:
-        # Fallback to projected features comparison
-        image_sim = compute_feature_similarity(
-            student_image_features, teacher_image_features, prefix="image_sim_"
-        )
+    image_sim = compute_feature_similarity(student_image_features, teacher_image_features, prefix="image_sim_")
     metrics.update(image_sim)
 
-    if (
-        projection_t is not None
-        and student_text_raw is not None
-        and teacher_text_raw is not None
-    ):
-        # Project student raw features to teacher dimension
-        student_text_proj = projection_t(student_text_raw)
-        student_text_proj_norm = F.normalize(student_text_proj, dim=-1)
-        teacher_text_raw_norm = F.normalize(teacher_text_raw, dim=-1)
-        text_sim = compute_feature_similarity(
-            student_text_proj_norm, teacher_text_raw_norm, prefix="text_sim_"
-        )
-    else:
-        # Fallback to projected features comparison
-        text_sim = compute_feature_similarity(
-            student_text_features, teacher_text_features, prefix="text_sim_"
-        )
+    text_sim = compute_feature_similarity(student_text_features, teacher_text_features, prefix="text_sim_")
     metrics.update(text_sim)
 
     # 4. Cross-modal alignment quality
     # How well does student match teacher in cross-modal retrieval?
-    student_logits_per_image = logit_scale * student_image_features @ student_text_features.T
-    teacher_logits_per_image = logit_scale * teacher_image_features @ teacher_text_features.T
+    student_logits_per_image = (
+        student_logit_scale * student_image_features @ student_text_features.T + student_logit_bias
+    )
+    teacher_logits_per_image = (
+        teacher_logit_scale * teacher_image_features @ teacher_text_features.T + teacher_logit_bias
+    )
 
     # Compute correlation between student and teacher similarity matrices
     student_logits_flat = student_logits_per_image.flatten()

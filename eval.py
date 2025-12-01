@@ -4,8 +4,6 @@ Image-text retrieval evaluation on full validation set.
 This script evaluates the model on image-text retrieval tasks (e.g., COCO),
 matching the evaluation protocol used in SigLIP 2 paper. This is different from
 batch-internal evaluation during training, which only searches within a small batch.
-
-For ImageNet-1k zero-shot classification evaluation, use eval_imagenet1k.py instead.
 """
 
 import argparse
@@ -16,8 +14,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from tinysiglip.coco_dataset import COCOCaptionDatasetFactory, collate_coco_batch
-from tinysiglip.model import TinySiglipModel
+from tinysiglip.coco_dataset import COCOCaptionDataset, collate_coco_batch
+from tinysiglip.model import TinySiglipConfig, TinySiglipModel
 from tinysiglip.processor import TinySiglipProcessor
 
 
@@ -29,23 +27,27 @@ def load_checkpoint(checkpoint_path: str, device: str = "cuda"):
 
 def create_model_from_checkpoint(checkpoint, device: str = "cuda"):
     """Create and load model from checkpoint."""
-    config = checkpoint.get("config", {})
+    # Try to load model config from checkpoint (new format)
+    if "model_config" in checkpoint:
+        model_config = TinySiglipConfig.from_dict(checkpoint["model_config"])
+    else:
+        # Fallback to old format: extract from config dict
+        config = checkpoint.get("config", {})
+        student_cfg = config.get("student", {})
+        training_cfg = config.get("training", {})
+        model_config = TinySiglipConfig(
+            vision_model_name=student_cfg.get("vision_model_name", "vit_tiny_patch16_224"),
+            text_vocab_size=student_cfg.get("vocab_size", 32000),
+            text_seq_len=training_cfg.get("text_seq_len", 64),
+            text_dim=student_cfg.get("text_dim", 384),
+            text_layers=student_cfg.get("text_layers", 4),
+            text_nhead=student_cfg.get("text_nhead", 8),
+            text_ff_dim_multiplier=student_cfg.get("text_ff_dim_multiplier", 4),
+            projection_dim=student_cfg.get("projection_dim", 384),
+        )
 
-    # Extract student model config
-    student_cfg = config.get("student", {})
-
-    # Create model
-    model = TinySiglipModel(
-        vision_model_name=student_cfg.get("vision_model_name", "vit_tiny_patch16_224"),
-        vision_dim=student_cfg.get("vision_dim", 384),
-        text_vocab_size=student_cfg.get("vocab_size", 32000),
-        text_seq_len=config.get("training", {}).get("text_seq_len", 64),
-        text_dim=student_cfg.get("text_dim", 384),
-        text_layers=student_cfg.get("text_layers", 4),
-        text_nhead=student_cfg.get("text_nhead", 8),
-        text_ff_dim_multiplier=student_cfg.get("text_ff_dim_multiplier", 4),
-        projection_dim=student_cfg.get("projection_dim", 384),
-    ).to(device)
+    # Create model from config
+    model = TinySiglipModel(config=model_config).to(device)
 
     # Load weights
     model.load_state_dict(checkpoint["student_model"])
@@ -101,16 +103,13 @@ def create_processor_from_config(config, device: str = "cuda"):
 def evaluate_retrieval_coco(
     model: TinySiglipModel,
     processor: TinySiglipProcessor,
-    split: str = "val",
+    dataset_path: str,  # Path to cached embeddings directory
     batch_size: int = 32,
     num_workers: int = 4,
     device: str = "cuda",
     logit_scale: float | None = None,
-    cache_dir: str | None = None,
     k_values=(1, 5, 10),
     max_samples: int | None = None,
-    coco_root: str | None = None,
-    coco_ann_file: str | None = None,
 ):
     """
     Evaluate image-text retrieval on COCO validation set.
@@ -131,25 +130,14 @@ def evaluate_retrieval_coco(
         dict: Retrieval metrics
     """
     # Create dataset
-    print(f"Loading COCO Caption 2017 {split} split...")
-    # Get image_size and max_seq_len from processor
-    image_size = (
-        processor.image_processor.image_size
-        if hasattr(processor, "image_processor") and hasattr(processor.image_processor, "image_size")
-        else 224
-    )
+    print(f"Loading dataset from cache: {dataset_path}")
     max_seq_len = processor.max_seq_len if hasattr(processor, "max_seq_len") else 64
-    dataset = COCOCaptionDatasetFactory(
-        split=split,
-        image_size=image_size,
-        student_processor=processor,
-        teacher_processor=None,  # Not needed for evaluation
+
+    dataset = COCOCaptionDataset(
+        dataset_path=dataset_path,
+        processor=processor,
         max_seq_len=max_seq_len,
-        cache_dir=cache_dir,
-        use_augmentation=False,  # No augmentation for evaluation
-        streaming=False,  # Need full dataset for proper evaluation
-        coco_root=coco_root,
-        coco_ann_file=coco_ann_file,
+        verbose=True,
     )
 
     # Create dataloader
@@ -192,12 +180,9 @@ def evaluate_retrieval_coco(
                 image = images[i : i + 1]
                 text_id = text_ids_batch[i : i + 1]
 
-                # Extract image feature
-                image_feat, _, _, _ = model(image, text_id)
+                # Extract image and text features
+                image_feat, text_feat = model(image, text_id)
                 image_feat = F.normalize(image_feat, dim=-1)
-
-                # Extract text feature
-                _, text_feat, _, _ = model(image, text_id)
                 text_feat = F.normalize(text_feat, dim=-1)
                 all_text_features_list.append(text_feat.cpu())
 
@@ -353,28 +338,10 @@ def main():
         help="Logit scale (temperature). If None, uses checkpoint value or default 1.0",
     )
     parser.add_argument(
-        "--cache-dir",
-        type=str,
-        default=None,
-        help="Directory to cache the dataset (default: None)",
-    )
-    parser.add_argument(
         "--max-samples",
         type=int,
         default=None,
         help="Maximum number of samples to evaluate (default: None for all)",
-    )
-    parser.add_argument(
-        "--coco-root",
-        type=str,
-        default=None,
-        help="Root directory where COCO images are stored",
-    )
-    parser.add_argument(
-        "--coco-ann-file",
-        type=str,
-        default=None,
-        help="Path to COCO annotation JSON file",
     )
 
     args = parser.parse_args()
@@ -410,22 +377,19 @@ def main():
         raise ValueError("Could not load or create processor. Please check checkpoint and config.")
 
     # Evaluate
-    print(f"\n{'=' * 60}")
-    print(f"Evaluating on COCO Caption 2017 {args.split} split")
-    print(f"{'=' * 60}\n")
+    print("\n" + "=" * 60)
+    print("Evaluating on COCO Caption dataset")
+    print("=" * 60 + "\n")
 
     results = evaluate_retrieval_coco(
         model=model,
         processor=processor,
-        split=args.split,
+        dataset_path=args.dataset_path,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         device=args.device,
         logit_scale=logit_scale,
-        cache_dir=args.cache_dir,
         max_samples=args.max_samples,
-        coco_root=args.coco_root,
-        coco_ann_file=args.coco_ann_file,
     )
 
     if results:

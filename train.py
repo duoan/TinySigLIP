@@ -17,13 +17,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-from transformers import (
-    AutoModel,
-    AutoProcessor,
-    AutoTokenizer,
-    SiglipModel,
-    get_cosine_schedule_with_warmup,
-)
+from transformers import AutoModel, AutoProcessor, get_cosine_schedule_with_warmup
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 try:
     import wandb
@@ -34,23 +30,16 @@ except ImportError:
     print("Warning: wandb not installed. Install with: pip install wandb")
 
 try:
-    from fvcore.nn import FlopCountMode, flop_count  # type: ignore[import-untyped]
+    from fvcore.nn import flop_count  # type: ignore[import-untyped]
 
     FVCORE_AVAILABLE = True
 except ImportError:
     FVCORE_AVAILABLE = False
 
-from tinysiglip.coco_dataset import COCOCaptionDatasetFactory, collate_coco_batch
-from tinysiglip.embedding_distillation import (
-    create_dummy_token_mapping,
-    create_token_mapping,
-    transfer_embedding_weights,
-)
-from tinysiglip.fake_dataset import DummySiglipDataset
+from tinysiglip.coco_dataset import COCOCaptionDataset, collate_coco_batch
 from tinysiglip.loss import compute_total_loss
 from tinysiglip.metrics import compute_evaluation_metrics
-from tinysiglip.model import TinySiglipModel
-from tinysiglip.processor import TinySiglipProcessor
+from tinysiglip.model import TinySiglipConfig, TinySiglipModel
 
 
 def setup_distributed():
@@ -132,8 +121,46 @@ def compute_flops(
             dummy_text_ids = torch.randint(1, 1000, (1, text_seq_len)).to(device)
 
             # Count FLOPs
-            flops_dict, _ = flop_count(model, (dummy_images, dummy_text_ids), mode=FlopCountMode.TRAIN)
-            total_flops = sum(flops_dict.values())
+            flops_dict, _ = flop_count(model, (dummy_images, dummy_text_ids))
+
+            # fvcore returns a dict where values might be FlopCountMode objects or numbers
+            # Convert all values to numbers
+            total_flops = 0.0
+            for value in flops_dict.values():
+                if isinstance(value, (int, float)):
+                    total_flops += float(value)
+                elif hasattr(value, "total"):
+                    # FlopCountMode object - check if total is callable
+                    total_method = getattr(value, "total", None)
+                    if callable(total_method):
+                        total_flops += float(total_method())  # type: ignore[arg-type]
+                    else:
+                        # Try to use as number
+                        try:
+                            total_flops += float(value)  # type: ignore[arg-type]
+                        except (ValueError, TypeError):
+                            pass
+                else:
+                    # Try to convert to number
+                    try:
+                        total_flops += float(value)  # type: ignore[arg-type]
+                    except (ValueError, TypeError):
+                        pass
+
+            # If total_flops is still very small, fvcore might not have captured everything
+            # Fall back to estimation if result seems unreasonable (< 1M FLOPs)
+            if total_flops < 1e6:
+                # Use estimation instead
+                total_params = sum(p.numel() for p in model.parameters())
+                # Rough estimate: for vision transformer + text transformer
+                # Vision: approximately 2 * image_size^2 * num_patches * hidden_dim operations
+                # Text: approximately 2 * text_seq_len^2 * hidden_dim operations
+                # This is a simplified estimate
+                vision_flops_estimate = image_size * image_size * 3 * 2  # Input processing
+                text_flops_estimate = text_seq_len * text_seq_len * 2  # Attention
+                # Add parameter-based estimate
+                param_flops = total_params * 2  # Rough: 2 FLOPs per parameter
+                total_flops = vision_flops_estimate + text_flops_estimate + param_flops
 
             return {
                 "total_flops": total_flops,
@@ -142,7 +169,18 @@ def compute_flops(
             }
         except Exception as e:
             print(f"Warning: Could not compute FLOPs with fvcore: {e}")
-            return {"total_flops": None, "total_flops_g": None, "flops_per_sample": None}
+            # Fall back to estimation
+            total_params = sum(p.numel() for p in model.parameters())
+            vision_flops_estimate = image_size * image_size * 3 * 2
+            text_flops_estimate = text_seq_len * text_seq_len * 2
+            param_flops = total_params * 2
+            total_flops_estimate = vision_flops_estimate + text_flops_estimate + param_flops
+            return {
+                "total_flops": total_flops_estimate,
+                "total_flops_g": total_flops_estimate / 1e9,
+                "flops_per_sample": total_flops_estimate,
+                "note": "Estimated (fvcore failed)",
+            }
     else:
         # Simple estimation based on model parameters and operations
         # This is a rough estimate
@@ -160,27 +198,6 @@ def compute_flops(
             "flops_per_sample": total_flops_estimate,
             "note": "Estimated (install fvcore for accurate FLOPs)",
         }
-
-
-def get_teacher_model(model_name="google/siglip2-base-patch16-224", device=None) -> SiglipModel:
-    """Load teacher SigLIP model."""
-    if device is None:
-        if torch.cuda.is_available():
-            device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            # macOS Metal Performance Shaders (Apple Silicon)
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
-    try:
-        from transformers import SiglipModel
-
-        model = SiglipModel.from_pretrained(model_name).to(device)  # pyright: ignore[reportArgumentType]
-    except ImportError:
-        # Fallback to AutoModel if SiglipModel is not available
-        model = AutoModel.from_pretrained(model_name).to(device)
-    model.eval()
-    return cast(SiglipModel, model)
 
 
 @hydra.main(version_base=None, config_path="config", config_name="config")
@@ -201,7 +218,6 @@ def main(cfg: DictConfig) -> None:
         print(f"Using device: {device}")
 
     # Extract configuration values
-    TEACHER_MODEL_NAME = cfg.teacher.model_name
     BATCH_SIZE = cfg.training.batch_size
     IMAGE_SIZE = cfg.training.image_size
     TEXT_SEQ_LEN = cfg.training.text_seq_len
@@ -209,52 +225,84 @@ def main(cfg: DictConfig) -> None:
     LEARNING_RATE = cfg.training.learning_rate
     WARMUP_EPOCHS = cfg.training.get("warmup_epochs", 1)
     USE_COSINE_SCHEDULER = cfg.training.use_cosine_scheduler
-
-    USE_REAL_DATA = cfg.dataset.use_real_data
-    DATASET_SPLIT = cfg.dataset.split
-    DATASET_CACHE_DIR = cfg.dataset.cache_dir
-    USE_AUGMENTATION = cfg.dataset.use_augmentation
     DATASET_NUM_WORKERS = cfg.dataset.get("num_workers", 0)
-    USE_STREAMING = cfg.dataset.get("streaming", False)
 
-    # Enforce non-streaming mode for epoch-based training
-    if USE_STREAMING:
-        if is_main_process(rank):
-            print("Warning: streaming mode is not compatible with epoch-based training.")
-            print("Forcing streaming=False for epoch-based training.")
-        USE_STREAMING = False
+    # ====== STEP 1: Force load and validate cache metadata at the very beginning ======
+    import json
+    import re
 
-    # Handle COCO paths - convert relative paths to absolute
-    coco_root_raw = cfg.dataset.get("coco_root", None)
-    coco_ann_file_raw = cfg.dataset.get("coco_ann_file", None)
+    project_root = Path(__file__).parent.resolve()
+    CACHE_PATH = cfg.dataset.get("dataset_path", None)
+    DATASET_CACHE_DIR = cfg.dataset.get("cache_dir", None)
 
-    if coco_root_raw is not None:
-        # Convert relative path to absolute path (relative to project root)
-        if not os.path.isabs(coco_root_raw):
-            project_root = Path(__file__).parent.resolve()
-            COCO_ROOT = str(project_root / coco_root_raw)
-        else:
-            COCO_ROOT = coco_root_raw
-    else:
-        COCO_ROOT = None
+    # Auto-detect cache path if not provided
+    if CACHE_PATH is None and DATASET_CACHE_DIR is not None:
+        cache_base_dir = Path(DATASET_CACHE_DIR)
+        if not cache_base_dir.is_absolute():
+            cache_base_dir = project_root / cache_base_dir
 
-    if coco_ann_file_raw is not None:
-        # Convert relative path to absolute path (relative to project root)
-        if not os.path.isabs(coco_ann_file_raw):
-            project_root = Path(__file__).parent.resolve()
-            COCO_ANN_FILE = str(project_root / coco_ann_file_raw)
-        else:
-            COCO_ANN_FILE = coco_ann_file_raw
-    else:
-        COCO_ANN_FILE = None
+        # Get teacher model name from config (will be replaced by metadata later)
+        teacher_model_name_config = cfg.teacher.model_name
+        safe_model_name = re.sub(r"[^\w\-_]", "_", teacher_model_name_config).strip("_")
+        split_config = cfg.dataset.get("split", "val")
 
-    STUDENT_VOCAB_SIZE = cfg.student.vocab_size
-    STUDENT_TOKENIZER_NAME = cfg.student.tokenizer_name
+        # Try different dataset sizes (tiny, medium, large)
+        # For each size, try the configured split first, then fall back to other common splits
+        splits_to_try = [split_config] + [s for s in ["train", "val", "test"] if s != split_config]
 
+        for dataset_size_name in ["tiny", "medium", "large"]:
+            for split_name in splits_to_try:
+                cache_path_candidate = cache_base_dir / safe_model_name / dataset_size_name / split_name
+                metadata_file = cache_path_candidate / "metadata.json"
+                if metadata_file.exists():
+                    CACHE_PATH = str(cache_path_candidate)
+                    if is_main_process(rank):
+                        if split_name != split_config:
+                            print(
+                                f"⚠ Warning: Config specifies split '{split_config}' but found cache for "
+                                f"'{split_name}'. Using: {CACHE_PATH}"
+                            )
+                        else:
+                            print(f"✓ Auto-detected cache: {CACHE_PATH}")
+                    break
+            if CACHE_PATH is not None:
+                break
+
+    # Assert: Cache path is required
+    if CACHE_PATH is None:
+        raise ValueError("Cache path is required. Set dataset.cache_path in config.yaml or run prepare_data.py first.")
+
+    # Convert to absolute path
+    if not os.path.isabs(CACHE_PATH):
+        CACHE_PATH = str(project_root / CACHE_PATH)
+
+    # Assert: Cache metadata file must exist
+    metadata_file = Path(CACHE_PATH) / "metadata.json"
+    if not metadata_file.exists():
+        raise FileNotFoundError(f"Cache not found: {CACHE_PATH}. Please run prepare_data.py first to generate cache.")
+
+    # Load cache metadata - MUST exist
+    with open(metadata_file, encoding="utf-8") as f:
+        cache_metadata = json.load(f)
+
+    # Assert: Cache metadata must contain required fields
+    assert cache_metadata is not None, "Cache metadata is required"
+    assert "teacher_model_name" in cache_metadata, "Cache metadata must contain teacher_model_name"
+    assert "image_embed_dim" in cache_metadata, "Cache metadata must contain image_embed_dim"
+
+    if is_main_process(rank):
+        print(f"✓ Cache loaded: {CACHE_PATH}")
+        print(f"  Teacher model: {cache_metadata.get('teacher_model_name', 'unknown')}")
+        print(f"  Images: {cache_metadata.get('num_images', 0)}")
+        print(f"  Captions: {cache_metadata.get('total_captions', 0)}")
+
+    # data_dir is inferred from dataset_path convention: data/coco/cache/... -> data/coco
+    # No need to store it in metadata
+
+    LAMBDA_SIGLIP = cfg.loss.lambda_siglip
     LAMBDA_CMD = cfg.loss.lambda_cmd
     LAMBDA_UMD = cfg.loss.lambda_umd
     TEMPERATURE = cfg.loss.temperature
-    USE_WEIGHT_TRANSFER = cfg.embedding.use_weight_transfer
 
     # Get output directory from Hydra
     from hydra.core.hydra_config import HydraConfig
@@ -302,200 +350,127 @@ def main(cfg: DictConfig) -> None:
             print(f"Distributed training: {world_size} GPUs")
         print("=" * 70 + "\n")
 
-    # Load teacher model and processor
-    if is_main_process(rank):
-        print("Loading teacher model...")
-    teacher_model = get_teacher_model(TEACHER_MODEL_NAME, device=device)
-    teacher_config = teacher_model.config
+    # ====== STEP 2: Load processor and get dimensions from cache metadata ======
+    # Get teacher model name from cache metadata (required)
+    teacher_model_name = cache_metadata["teacher_model_name"]
 
-    # Load teacher processor (recommended for proper preprocessing)
+    # Load processor (single processor, used for both teacher and student)
     if is_main_process(rank):
-        print("Loading teacher processor...")
+        print(f"Loading processor from: {teacher_model_name}")
+    processor = AutoProcessor.from_pretrained(teacher_model_name)
+    if is_main_process(rank):
+        print("✓ Processor loaded")
+
+    # Load teacher model to count parameters and get teacher model logit scale and bias
+    teacher_total_params = None
+    teacher_trainable_params = None
+    teacher_vision_params = None
+    teacher_text_params = None
+    teacher_logit_scale = None
+    teacher_logit_bias = None
+    if is_main_process(rank):
+        print(f"\nLoading teacher model from: {teacher_model_name}")
     try:
-        teacher_processor = AutoProcessor.from_pretrained(TEACHER_MODEL_NAME)
+        teacher_model = AutoModel.from_pretrained(teacher_model_name)
+        teacher_model.eval()  # Set to eval mode
+        teacher_total_params = sum(p.numel() for p in teacher_model.parameters())
+        teacher_trainable_params = sum(p.numel() for p in teacher_model.parameters() if p.requires_grad)
+
+        teacher_logit_scale = teacher_model.logit_scale.exp().item()
+        teacher_logit_bias = teacher_model.logit_bias.item()
+
+        print("=" * 30)
+        print(f"TEACHER_SCALE = {teacher_logit_scale}")
+        print(f"TEACHER_BIAS  = {teacher_logit_bias}")
+        print("=" * 30)
+
+        # Count vision and text model parameters separately
+        if hasattr(teacher_model, "vision_model"):
+            teacher_vision_params = sum(p.numel() for p in teacher_model.vision_model.parameters())
+        elif hasattr(teacher_model, "model") and hasattr(teacher_model.model, "vision_model"):
+            teacher_vision_params = sum(p.numel() for p in teacher_model.model.vision_model.parameters())
+        else:
+            # Try to find vision-related parameters by name
+            teacher_vision_params = sum(
+                p.numel() for name, p in teacher_model.named_parameters() if "vision" in name.lower()
+            )
+
+        if hasattr(teacher_model, "text_model"):
+            teacher_text_params = sum(p.numel() for p in teacher_model.text_model.parameters())
+        elif hasattr(teacher_model, "model") and hasattr(teacher_model.model, "text_model"):
+            teacher_text_params = sum(p.numel() for p in teacher_model.model.text_model.parameters())
+        else:
+            # Try to find text-related parameters by name
+            teacher_text_params = sum(
+                p.numel() for name, p in teacher_model.named_parameters() if "text" in name.lower()
+            )
+
         if is_main_process(rank):
-            print("✓ Teacher processor loaded")
+            print("\n=== Teacher Model Parameters ===")
+            print(f"Total parameters: {teacher_total_params:,} ({format_number(teacher_total_params)})")
+            print(f"Trainable parameters: {teacher_trainable_params:,} ({format_number(teacher_trainable_params)})")
+            if teacher_vision_params is not None:
+                print(f"Vision model: {teacher_vision_params:,} ({format_number(teacher_vision_params)})")
+            if teacher_text_params is not None:
+                print(f"Text model: {teacher_text_params:,} ({format_number(teacher_text_params)})")
+            print("================================\n")
+
+        # Free memory - we don't need the teacher model during training (using cached embeddings)
+        del teacher_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     except Exception as e:
         if is_main_process(rank):
-            print(f"Warning: Could not load teacher processor: {e}")
-        teacher_processor = None
+            print(f"Warning: Could not load teacher model to count parameters: {e}")
 
-    # Load tokenizers and create student processor for real data
-    student_tokenizer = None
-    teacher_tokenizer = None
-    student_processor = None
-    if USE_REAL_DATA:
-        if is_main_process(rank):
-            print("Loading tokenizers for real data...")
-
-        # Load teacher tokenizer (from processor or separately)
-        if teacher_processor is not None:
-            try:
-                teacher_tokenizer = teacher_processor.tokenizer
-                print("✓ Teacher tokenizer loaded from processor")
-            except Exception as e:
-                print(f"Warning: Could not get tokenizer from processor: {e}")
-                teacher_tokenizer = None
-
-        if teacher_tokenizer is None:
-            try:
-                teacher_tokenizer = AutoTokenizer.from_pretrained(TEACHER_MODEL_NAME)
-                print("✓ Teacher tokenizer loaded directly")
-            except Exception as e:
-                error_msg = str(e)
-                print(f"Error: Could not load teacher tokenizer: {error_msg}")
-                if "protobuf" in error_msg.lower() or "sentencepiece" in error_msg.lower():
-                    print("\n" + "=" * 70)
-                    print("MISSING DEPENDENCY DETECTED")
-                    print("=" * 70)
-                    print("To fix this issue, please install the missing dependencies:")
-                    print("  uv add protobuf sentencepiece")
-                    print("  OR")
-                    print("  pip install protobuf sentencepiece")
-                    print("\nAlternatively, you can:")
-                    print("  1. Set USE_REAL_DATA = False to use dummy data")
-                    print("  2. Or install dependencies and restart the script")
-                    print("=" * 70 + "\n")
-                teacher_tokenizer = None
-
-        # Load student tokenizer
-        if STUDENT_TOKENIZER_NAME is not None:
-            try:
-                student_tokenizer = AutoTokenizer.from_pretrained(STUDENT_TOKENIZER_NAME)
-                print(f"✓ Student tokenizer loaded: {STUDENT_TOKENIZER_NAME}")
-            except Exception as e:
-                print(f"Warning: Could not load student tokenizer {STUDENT_TOKENIZER_NAME}: {e}")
-                student_tokenizer = teacher_tokenizer  # Fallback to teacher tokenizer
-        else:
-            # Use teacher tokenizer as fallback
-            student_tokenizer = teacher_tokenizer
-            if student_tokenizer is not None:
-                print("Using teacher tokenizer for student (no separate student tokenizer specified)")
-
-        if student_tokenizer is None:
-            print("\n" + "=" * 70)
-            print("ERROR: Could not load any tokenizer for real data")
-            print("=" * 70)
-            print("Options:")
-            print("  1. Install missing dependencies:")
-            print("     uv add protobuf sentencepiece")
-            print("  2. Use dummy data instead:")
-            print("     Set USE_REAL_DATA = False in train.py")
-            print("=" * 70 + "\n")
-            raise ValueError("Could not load any tokenizer. Cannot use real data without tokenizer.")
-
-        # Create student processor from tokenizer
-        if student_tokenizer is not None:
-            # Extract image processor from teacher processor or create new one
-            student_image_processor = None
-            if teacher_processor is not None:
-                if hasattr(teacher_processor, "image_processor"):
-                    student_image_processor = teacher_processor.image_processor
-                elif hasattr(teacher_processor, "feature_extractor"):
-                    student_image_processor = teacher_processor.feature_extractor
-
-            # Create student processor
-            student_processor = TinySiglipProcessor(
-                tokenizer=student_tokenizer,
-                image_processor=student_image_processor,
-                image_size=IMAGE_SIZE,
-                max_seq_len=TEXT_SEQ_LEN,
-                use_augmentation=False,  # Will be set based on split when creating dataset
-            )
-            print("✓ Student processor created")
-
-    # Get teacher dimensions
-    teacher_projection_dim = getattr(teacher_config, "projection_dim", 768)
-
-    # Try different ways to access vision/text dimensions
-    if hasattr(teacher_config, "vision_config"):
-        teacher_vision_dim = teacher_config.vision_config.hidden_size
-    elif hasattr(teacher_config, "vision_hidden_size"):
-        teacher_vision_dim = teacher_config.vision_hidden_size
-    else:
-        teacher_vision_dim = 768  # Default fallback
-
-    if hasattr(teacher_config, "text_config"):
-        teacher_text_dim = teacher_config.text_config.hidden_size
-        teacher_vocab_size = teacher_config.text_config.vocab_size
-    elif hasattr(teacher_config, "text_hidden_size"):
-        teacher_text_dim = teacher_config.text_hidden_size
-        teacher_vocab_size = getattr(teacher_config, "vocab_size", 32000)
-    else:
-        teacher_text_dim = 768  # Default fallback
-        teacher_vocab_size = 32000  # Default fallback
-
-    # Get actual vocab size from model if available
-    if hasattr(teacher_model, "text_model") and hasattr(teacher_model.text_model, "embeddings"):
-        embeddings = teacher_model.text_model.embeddings
-        if hasattr(embeddings, "token_embedding"):
-            embed_layer = embeddings.token_embedding
-            if isinstance(embed_layer, nn.Module) and hasattr(embed_layer, "num_embeddings"):
-                teacher_vocab_size = cast(int, embed_layer.num_embeddings)
-        elif hasattr(embeddings, "word_embeddings"):
-            embed_layer = embeddings.word_embeddings
-            if isinstance(embed_layer, nn.Module) and hasattr(embed_layer, "num_embeddings"):
-                teacher_vocab_size = cast(int, embed_layer.num_embeddings)
+    # Get dimensions from cache metadata (required)
+    teacher_projection_dim = cache_metadata["image_embed_dim"]
+    # Get vocab size from processor tokenizer
+    vocab_size = len(processor.tokenizer) if hasattr(processor.tokenizer, "__len__") else 32000
 
     if is_main_process(rank):
-        print(f"Teacher projection dim: {teacher_projection_dim}")
-        print(f"Teacher vision dim: {teacher_vision_dim}")
-        print(f"Teacher text dim: {teacher_text_dim}")
-        print(f"Teacher vocab size: {teacher_vocab_size}")
+        print("✓ Using dimensions from cache metadata:")
+        print(f"  Projection dim: {teacher_projection_dim}")
+        print(f"  Vocab size: {vocab_size}")
 
-    # Determine student vocab size (use configured value or teacher's vocab size)
-    if STUDENT_VOCAB_SIZE is None:
-        STUDENT_VOCAB_SIZE = cast(int, teacher_vocab_size)
-        if is_main_process(rank):
-            print(f"\nStudent vocab size: {STUDENT_VOCAB_SIZE} (same as teacher)")
-    else:
-        if is_main_process(rank):
-            print(f"\nStudent vocab size: {STUDENT_VOCAB_SIZE} (English-only)")
-            print("Note: In real training, use tokenizers to map text to token IDs for each model")
+    # According to plan.md: Student output dimension must match Teacher's projection_dim
+    # Use projection_dim from cache metadata (no need to read from config)
+    STUDENT_PROJECTION_DIM = cast(int, teacher_projection_dim)
+    STUDENT_VOCAB_SIZE = cast(int, vocab_size)
 
-    # Calculate valid token ID range (for dummy data only)
-    # Use the smaller of the two vocab sizes for token generation
-    # In real training, you'd use a tokenizer to map between vocabularies
-    max_valid_token_id_student = max(1, STUDENT_VOCAB_SIZE - 10)
-    max_valid_token_id_teacher = max(1, cast(int, teacher_vocab_size) - 10)
-
-    # Create student model
     if is_main_process(rank):
-        print("Creating student model...")
-    student_model = TinySiglipModel(
+        print(f"\n✓ Student projection_dim: {STUDENT_PROJECTION_DIM}")
+        print(f"✓ Student vocab_size: {STUDENT_VOCAB_SIZE} (from cache metadata)")
+
+    # Create student model config
+    if is_main_process(rank):
+        print("Creating student model config...")
+    student_config = TinySiglipConfig(
         vision_model_name=cfg.student.vision_model_name,
-        vision_dim=cfg.student.vision_dim,
         text_vocab_size=STUDENT_VOCAB_SIZE,
         text_seq_len=TEXT_SEQ_LEN,
         text_dim=cfg.student.text_dim,
         text_layers=cfg.student.text_layers,
         text_nhead=cfg.student.text_nhead,
         text_ff_dim_multiplier=cfg.student.text_ff_dim_multiplier,
-        projection_dim=cfg.student.projection_dim,
-    ).to(device)
+        projection_dim=STUDENT_PROJECTION_DIM,  # Use teacher's projection_dim
+    )
 
-    # Get student raw dimensions
-    with torch.no_grad():
-        dummy_images = torch.rand(1, 3, IMAGE_SIZE, IMAGE_SIZE).to(device)  # [0, 1]
-        dummy_text = torch.randint(1, max_valid_token_id_student + 1, (1, TEXT_SEQ_LEN)).to(device)
-        _, _, student_vision_raw, student_text_raw = student_model(dummy_images, dummy_text)
-        student_vision_dim = student_vision_raw.shape[-1]
-        student_text_dim = student_text_raw.shape[-1]
-
+    # Create student model
     if is_main_process(rank):
-        print(f"Student vision raw dim: {student_vision_dim}")
-        print(f"Student text raw dim: {student_text_dim}")
+        print("Creating student model...")
+    student_model = TinySiglipModel(config=student_config).to(device)
 
     # Count parameters
-    vision_backbone_params = count_parameters(student_model.vision_backbone)
-    vision_proj_params = count_parameters(student_model.vision_proj)
+    vision_backbone_params = count_parameters(student_model.vision_model.encoder)
+    vision_proj_params = count_parameters(student_model.vision_model.projection)
     vision_params = vision_backbone_params + vision_proj_params
 
     # Text model parameters (including position embedding which is a Parameter)
-    text_embedding_params = count_parameters(student_model.text_embedding)
-    text_transformer_params = count_parameters(student_model.text_transformer)
-    text_proj_params = count_parameters(student_model.text_proj)
-    text_pos_params = student_model.text_pos_embedding.numel()  # Position embedding is a Parameter
+    text_embedding_params = count_parameters(student_model.text_model.embedding)
+    text_transformer_params = count_parameters(student_model.text_model.transformer)
+    text_proj_params = count_parameters(student_model.text_model.projection)
+    text_pos_params = student_model.text_model.pos_embedding.numel()  # Position embedding is a Parameter
     text_params = text_embedding_params + text_transformer_params + text_proj_params + text_pos_params
 
     total_params = count_parameters(student_model)
@@ -515,9 +490,56 @@ def main(cfg: DictConfig) -> None:
         print(f"\nTotal student model parameters: {total_params:,} ({format_number(total_params)})")
         print("========================\n")
 
-    # Get embedding layers (before DDP wrapping)
-    student_embedding_layer = student_model.text_embedding
-    student_embedding_dim = student_embedding_layer.embedding_dim
+        # Compare teacher and student model parameters
+        if teacher_total_params is not None:
+            print("=== Teacher vs Student Model Comparison ===")
+            print(f"Teacher model:  {teacher_total_params:,} ({format_number(teacher_total_params)})")
+            if teacher_vision_params is not None:
+                print(f"  - Vision: {teacher_vision_params:,} ({format_number(teacher_vision_params)})")
+            if teacher_text_params is not None:
+                print(f"  - Text: {teacher_text_params:,} ({format_number(teacher_text_params)})")
+            print(f"Student model:  {total_params:,} ({format_number(total_params)})")
+            print(f"  - Vision: {vision_params:,} ({format_number(vision_params)})")
+            print(f"  - Text: {text_params:,} ({format_number(text_params)})")
+            compression_ratio = teacher_total_params / total_params if total_params > 0 else 0
+            size_reduction = (1 - total_params / teacher_total_params) * 100 if teacher_total_params > 0 else 0
+            print(f"Compression ratio: {compression_ratio:.2f}x")
+            print(f"Size reduction:   {size_reduction:.2f}%")
+            print("==========================================\n")
+
+        # Log model parameters to WandB
+        if wandb_enabled:
+            # Teacher model parameters
+            if teacher_total_params is not None:
+                wandb.summary["teacher/total_params"] = teacher_total_params
+                wandb.summary["teacher/total_params_M"] = teacher_total_params / 1e6
+                if teacher_vision_params is not None:
+                    wandb.summary["teacher/vision_params"] = teacher_vision_params
+                    wandb.summary["teacher/vision_params_M"] = teacher_vision_params / 1e6
+                if teacher_text_params is not None:
+                    wandb.summary["teacher/text_params"] = teacher_text_params
+                    wandb.summary["teacher/text_params_M"] = teacher_text_params / 1e6
+
+            # Student model parameters
+            wandb.summary["student/total_params"] = total_params
+            wandb.summary["student/total_params_M"] = total_params / 1e6
+            wandb.summary["student/vision_params"] = vision_params
+            wandb.summary["student/vision_params_M"] = vision_params / 1e6
+            wandb.summary["student/text_params"] = text_params
+            wandb.summary["student/text_params_M"] = text_params / 1e6
+            wandb.summary["student/vision_backbone_params"] = vision_backbone_params
+            wandb.summary["student/vision_proj_params"] = vision_proj_params
+            wandb.summary["student/text_embedding_params"] = text_embedding_params
+            wandb.summary["student/text_transformer_params"] = text_transformer_params
+            wandb.summary["student/text_proj_params"] = text_proj_params
+            wandb.summary["student/text_pos_params"] = text_pos_params
+
+            # Compression metrics
+            if teacher_total_params is not None:
+                compression_ratio = teacher_total_params / total_params if total_params > 0 else 0
+                size_reduction = (1 - total_params / teacher_total_params) * 100 if teacher_total_params > 0 else 0
+                wandb.summary["compression/ratio"] = compression_ratio
+                wandb.summary["compression/size_reduction_pct"] = size_reduction
 
     # Wrap model with DDP if using distributed training
     if use_distributed:
@@ -527,77 +549,37 @@ def main(cfg: DictConfig) -> None:
         if is_main_process(rank):
             print("✓ Student model wrapped with DistributedDataParallel")
 
-    # Get teacher embedding layer
-    teacher_embedding_layer: nn.Embedding | None = None
-    if hasattr(teacher_model, "text_model") and hasattr(teacher_model.text_model, "embeddings"):
-        embeddings = teacher_model.text_model.embeddings
-        if hasattr(embeddings, "token_embedding"):
-            teacher_embedding_layer = cast(nn.Embedding, embeddings.token_embedding)
-        elif hasattr(embeddings, "word_embeddings"):
-            teacher_embedding_layer = cast(nn.Embedding, embeddings.word_embeddings)
+    # Use fixed logit scale (temperature) - no need to learn it in distillation
+    # Original CLIP uses learnable logit_scale, but for distillation we can use a fixed value
+    logit_scale = torch.tensor(math.log(1 / 0.07), device=device)  # Fixed value, not a parameter
 
-    if teacher_embedding_layer is None:
-        if is_main_process(rank):
-            print("Warning: Could not find teacher embedding layer")
+    # Optimizer: use unwrapped model parameters (DDP wraps them, making them non-leaf)
+    # Get the underlying module if wrapped with DDP, otherwise use the model directly
+    model_for_optimizer = student_model.module if isinstance(student_model, DDP) else student_model
 
-    # Weight Transfer: One-time initialization of student embeddings from teacher
-    if USE_WEIGHT_TRANSFER and teacher_embedding_layer is not None:
-        if is_main_process(rank):
-            print("\n=== Performing Embedding Weight Transfer ===")
-        if hasattr(teacher_embedding_layer, "embedding_dim"):
-            teacher_embedding_dim = cast(int, teacher_embedding_layer.embedding_dim)
-        else:
-            teacher_embedding_dim = student_embedding_dim
-        if is_main_process(rank):
-            print(f"Student embedding dim: {student_embedding_dim}, Teacher embedding dim: {teacher_embedding_dim}")
+    # Collect model parameters and verify they are all leaf tensors
+    # This is critical: optimizer can only optimize leaf tensors
+    model_params = []
+    non_leaf_count = 0
+    for name, param in model_for_optimizer.named_parameters():
+        if param.requires_grad:
+            if param.is_leaf:
+                model_params.append(param)
+            else:
+                non_leaf_count += 1
+                if is_main_process(rank) and non_leaf_count <= 5:
+                    print(f"Warning: Skipping non-leaf parameter: {name}, shape={param.shape}")
 
-        # Create token mapping - use real tokenizers if available, otherwise use dummy
-        if is_main_process(rank):
-            print("Creating token mapping...")
-        if USE_REAL_DATA and student_tokenizer is not None and teacher_tokenizer is not None:
-            # Use real tokenizers to find shared tokens
-            if is_main_process(rank):
-                print("Using real tokenizers to find shared tokens...")
-            shared_student_indices, shared_teacher_indices = create_token_mapping(
-                teacher_tokenizer=teacher_tokenizer,
-                student_tokenizer=student_tokenizer,
-                verbose=is_main_process(rank),
-            )
-        else:
-            # Fallback to dummy mapping
-            if is_main_process(rank):
-                print("Using dummy token mapping (no tokenizers available or using dummy data)...")
-            shared_student_indices, shared_teacher_indices = create_dummy_token_mapping(
-                student_vocab_size=STUDENT_VOCAB_SIZE,
-                teacher_vocab_size=cast(int, teacher_vocab_size),
-                overlap_ratio=cfg.embedding.overlap_ratio,
-            )
-        if is_main_process(rank):
-            print(f"Shared tokens: {len(shared_student_indices)} (student) <-> {len(shared_teacher_indices)} (teacher)")
+    if non_leaf_count > 0 and is_main_process(rank):
+        print(f"Warning: Skipped {non_leaf_count} non-leaf parameters that require gradients")
 
-        # Transfer weights (use the embedding layer we already extracted before DDP wrapping)
-        transferred_count = transfer_embedding_weights(
-            student_embedding_layer=student_embedding_layer,
-            teacher_embedding_layer=teacher_embedding_layer,
-            shared_student_indices=shared_student_indices,
-            shared_teacher_indices=shared_teacher_indices,
-            verbose=is_main_process(rank),
+    if is_main_process(rank):
+        print(
+            f"Optimizer will optimize {len(model_params)} model parameters "
+            f"(using fixed logit_scale={logit_scale.item():.4f})"
         )
-        if is_main_process(rank):
-            print(f"Successfully transferred {transferred_count} embedding weights!")
-            print("No embedding mimicking loss needed - weights already initialized.")
-            print("=============================================\n")
 
-    # Create distillation projections (map student raw features to teacher raw features)
-    projection_v = nn.Linear(cast(int, student_vision_dim), cast(int, teacher_vision_dim)).to(device)
-    projection_t = nn.Linear(cast(int, student_text_dim), cast(int, teacher_text_dim)).to(device)
-    logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / 0.07)).to(device)
-    # Optimizer
-    optimizer_params = (
-        list(student_model.parameters()) + list(projection_v.parameters()) + list(projection_t.parameters())
-    )
-
-    optimizer = torch.optim.AdamW(optimizer_params, lr=LEARNING_RATE)
+    optimizer = torch.optim.AdamW(model_params, lr=LEARNING_RATE)
 
     # Calculate steps per epoch and total steps
     # Note: We'll calculate this after dataloader is created, so we'll initialize scheduler later
@@ -605,80 +587,39 @@ def main(cfg: DictConfig) -> None:
     total_steps = None
     warmup_steps = None
 
-    # Dataset and dataloader
-    if USE_REAL_DATA:
-        if is_main_process(rank):
-            print("\n=== Setting up COCO Dataset ===")
-        if student_processor is None:
-            raise ValueError("Student processor is required for real data")
-        if teacher_processor is None:
-            if is_main_process(rank):
-                print("Warning: Teacher processor not available. Using fallback preprocessing.")
+    # ====== STEP 3: Setup dataset (always use real data from cache) ======
+    if is_main_process(rank):
+        print("\n=== Setting up COCO Dataset ===")
 
-        # Update student processor augmentation based on split
-        use_augmentation_for_split = USE_AUGMENTATION and DATASET_SPLIT == "train"
-        if hasattr(student_processor.image_processor, "use_augmentation"):
-            student_processor.image_processor.use_augmentation = use_augmentation_for_split
-            student_processor.image_processor._build_transform()
+    # Use single processor for both student and teacher
+    dataset = COCOCaptionDataset(
+        dataset_path=CACHE_PATH,  # Required: path to cached embeddings
+        processor=processor,  # Single processor for both student and teacher
+        max_seq_len=TEXT_SEQ_LEN,
+        verbose=is_main_process(rank),
+    )
 
-        dataset = COCOCaptionDatasetFactory(
-            split=DATASET_SPLIT,
-            image_size=IMAGE_SIZE,
-            student_processor=student_processor,
-            teacher_processor=teacher_processor,
-            max_seq_len=TEXT_SEQ_LEN,
-            cache_dir=DATASET_CACHE_DIR,
-            use_augmentation=use_augmentation_for_split,
-            streaming=USE_STREAMING,
-            coco_root=COCO_ROOT,
-            coco_ann_file=COCO_ANN_FILE,
-            verbose=is_main_process(rank),  # Only print verbose messages on main process
-            is_main_process=is_main_process(rank),  # Only main process builds index cache
-        )
-        # Use DistributedSampler for distributed training
-        sampler = None
-        if use_distributed:
-            sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    # Use DistributedSampler for distributed training
+    sampler = None
+    if use_distributed:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
 
-        dataloader = DataLoader(
-            dataset,
-            batch_size=BATCH_SIZE,
-            shuffle=False if use_distributed else True,
-            sampler=sampler,
-            collate_fn=collate_coco_batch,
-            num_workers=DATASET_NUM_WORKERS,
-            pin_memory=True if (torch.cuda.is_available() and device.type == "cuda") else False,
-        )
-        # Print dataset info
-        if is_main_process(rank):
-            print(f"✓ COCO dataset loaded: {len(dataset)} samples")
-            print(f"  Steps per epoch: {len(dataloader)} (batch_size={BATCH_SIZE}, world_size={world_size})")
-            print("=" * 30 + "\n")
-    else:
-        if is_main_process(rank):
-            print("\n=== Using Dummy Dataset ===")
-        dataset = DummySiglipDataset(
-            num_samples=10000,
-            img_size=IMAGE_SIZE,
-            seq_len=TEXT_SEQ_LEN,
-            vocab_size=STUDENT_VOCAB_SIZE,  # Use student vocab size
-            max_token_id=max_valid_token_id_student,  # Use student vocab range
-        )
-        # Use DistributedSampler for dummy dataset if using distributed training
-        sampler = None
-        if use_distributed:
-            sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False if use_distributed else True,
+        sampler=sampler,
+        collate_fn=collate_coco_batch,
+        num_workers=DATASET_NUM_WORKERS,
+        pin_memory=True if (torch.cuda.is_available() and device.type == "cuda") else False,
+    )
 
-        dataloader = DataLoader(
-            dataset,
-            batch_size=BATCH_SIZE,
-            shuffle=False if use_distributed else True,
-            sampler=sampler,
-            num_workers=DATASET_NUM_WORKERS,
-        )
-        if is_main_process(rank):
-            print(f"✓ Dummy dataset created: {len(dataset)} samples")
-            print("=" * 30 + "\n")
+    # Print dataset info
+    if is_main_process(rank):
+        print(f"✓ COCO dataset loaded: {len(dataset)} samples")
+        print(f"  Steps per epoch: {len(dataloader)} (batch_size={BATCH_SIZE}, world_size={world_size})")
+        print(f"✓ Using cached embeddings from: {CACHE_PATH}")
+        print("=" * 30 + "\n")
 
     # Calculate steps per epoch and total steps for scheduler
     steps_per_epoch = len(dataloader)
@@ -752,9 +693,6 @@ def main(cfg: DictConfig) -> None:
     best_monitor_value = None
     best_step = 0
     best_model_state = None
-    best_projection_v_state = None
-    best_projection_t_state = None
-    best_logit_scale = None
 
     if early_stopping_enabled and is_main_process(rank):
         print("\n=== Early Stopping Enabled ===")
@@ -796,20 +734,11 @@ def main(cfg: DictConfig) -> None:
             # Track batch processing time
             batch_start_time = time.time()
 
-            if USE_REAL_DATA:
-                # COCO dataset returns a dict
-                student_images = batch["student_images"].to(device)
-                teacher_images = batch["teacher_images"].to(device)
-                student_text_ids = batch["student_text_ids"].to(device)
-                teacher_text_ids = batch["teacher_text_ids"].to(device)
-            else:
-                # Dummy dataset returns tuple
-                images, text_ids_student = batch
-                student_images = images.to(device)
-                teacher_images = images.to(device)  # Use same images for dummy data
-                student_text_ids = text_ids_student.to(device)
-                # Clamp to ensure they're within teacher vocab range
-                teacher_text_ids = torch.clamp(student_text_ids, max=max_valid_token_id_teacher)
+            # COCO dataset returns a dict
+            student_images = batch["student_images"].to(device)
+            student_text_ids = batch["student_text_ids"].to(device)
+            student_attention_mask = batch["student_attention_mask"].to(device)
+            # Note: teacher_images and teacher_text_ids may not be in batch if using cache
 
             # Track samples and tokens
             batch_size = student_images.size(0)
@@ -822,45 +751,27 @@ def main(cfg: DictConfig) -> None:
 
             optimizer.zero_grad()
 
-            # Teacher forward (frozen)
-            with torch.no_grad():
-                teacher_outputs = teacher_model(
-                    pixel_values=teacher_images,
-                    input_ids=teacher_text_ids,
-                    output_hidden_states=True,
-                )
-
-                teacher_image_features = teacher_outputs.image_embeds
-                teacher_text_features = teacher_outputs.text_embeds
-
-                # Get raw features from teacher
-                teacher_vision_outputs = teacher_model.vision_model(pixel_values=teacher_images)
-                teacher_text_outputs = teacher_model.text_model(input_ids=teacher_text_ids)
-
-                teacher_vision_raw = teacher_vision_outputs.last_hidden_state[:, 0, :]  # CLS token
-                teacher_text_raw = teacher_text_outputs.last_hidden_state[:, 0, :]  # CLS token
+            # Get teacher embeddings from cache (required - cache is mandatory)
+            # Cache is always used, no need to check or compute on-the-fly
+            teacher_image_features = batch["teacher_image_embeds"].to(device)
+            teacher_text_features = batch["teacher_text_embeds"].to(device)
 
             # Student forward (uses student vocab token IDs)
-            (
-                student_image_features,
-                student_text_features,
-                student_vision_raw,
-                student_text_raw,
-            ) = model_to_train(student_images, student_text_ids)
+            student_image_features, student_text_features, student_logit_scale, student_logit_bias = model_to_train(
+                student_images, student_text_ids, student_attention_mask
+            )
 
-            # Compute loss
+            # Compute loss (simplified: directly compare projected features)
             loss, loss_dict = compute_total_loss(
                 student_image_features=student_image_features,
                 student_text_features=student_text_features,
                 teacher_image_features=teacher_image_features,
                 teacher_text_features=teacher_text_features,
-                teacher_vision_raw=teacher_vision_raw,
-                teacher_text_raw=teacher_text_raw,
-                student_vision_raw=student_vision_raw,
-                student_text_raw=student_text_raw,
-                projection_v=projection_v,
-                projection_t=projection_t,
-                logit_scale=logit_scale,
+                student_logit_scale=student_logit_scale,
+                student_logit_bias=student_logit_bias,
+                teacher_logit_scale=cast(float, teacher_logit_scale),
+                teacher_logit_bias=cast(float, teacher_logit_bias),
+                lambda_siglip=LAMBDA_SIGLIP,
                 lambda_cmd=LAMBDA_CMD,
                 lambda_umd=LAMBDA_UMD,
                 temperature=TEMPERATURE,
@@ -904,13 +815,10 @@ def main(cfg: DictConfig) -> None:
                         student_text_features=student_text_features,
                         teacher_image_features=teacher_image_features,
                         teacher_text_features=teacher_text_features,
-                        logit_scale=logit_scale,
-                        projection_v=projection_v,
-                        projection_t=projection_t,
-                        student_vision_raw=student_vision_raw,
-                        student_text_raw=student_text_raw,
-                        teacher_vision_raw=teacher_vision_raw,
-                        teacher_text_raw=teacher_text_raw,
+                        student_logit_scale=student_logit_scale,
+                        student_logit_bias=student_logit_bias,
+                        teacher_logit_scale=cast(float, teacher_logit_scale),
+                        teacher_logit_bias=cast(float, teacher_logit_bias),
                     )
 
             # Early stopping check (check every eval_every_n_steps)
@@ -943,9 +851,6 @@ def main(cfg: DictConfig) -> None:
                     # Save best model state (only on main process)
                     if is_main_process(rank):
                         best_model_state = model_to_train.state_dict().copy()
-                        best_projection_v_state = projection_v.state_dict().copy()
-                        best_projection_t_state = projection_t.state_dict().copy()
-                        best_logit_scale = logit_scale.data.clone()
                         if global_step % log_every_n_steps == 0:
                             print(
                                 f"✓ New best {early_stopping_monitor}: {monitor_value:.6f} "
@@ -1105,17 +1010,9 @@ def main(cfg: DictConfig) -> None:
 
     # Restore best weights if early stopping was enabled and triggered
     if early_stopping_enabled and should_stop and restore_best_weights and is_main_process(rank):
-        if (
-            best_model_state is not None
-            and best_projection_v_state is not None
-            and best_projection_t_state is not None
-            and best_logit_scale is not None
-        ):
+        if best_model_state is not None:
             print(f"\nRestoring best model weights from step {best_step}...")
             model_to_train.load_state_dict(best_model_state)
-            projection_v.load_state_dict(best_projection_v_state)
-            projection_t.load_state_dict(best_projection_t_state)
-            logit_scale.data = best_logit_scale
             print(f"✓ Best weights restored (best {early_stopping_monitor}: {best_monitor_value:.6f})")
 
     if is_main_process(rank):
@@ -1152,18 +1049,10 @@ def main(cfg: DictConfig) -> None:
         print(f"Saving model to {checkpoint_path}...")
         # Get state dict from DDP model if needed
         # Use best model state if early stopping was enabled and best weights were restored
-        if (
-            early_stopping_enabled
-            and restore_best_weights
-            and best_model_state is not None
-            and best_projection_v_state is not None
-            and best_projection_t_state is not None
-            and best_logit_scale is not None
-        ):
+        if early_stopping_enabled and restore_best_weights and best_model_state is not None:
             model_state_dict = best_model_state
-            projection_v_state = best_projection_v_state
-            projection_t_state = best_projection_t_state
-            logit_scale_data = best_logit_scale
+            # logit_scale is fixed, so use the current value
+            logit_scale_data = logit_scale.item() if logit_scale.numel() == 1 else logit_scale
             best_epoch = best_step // steps_per_epoch if steps_per_epoch > 0 else 0
             print(
                 f"  Saving best model from step {best_step} (epoch {best_epoch + 1}) "
@@ -1171,16 +1060,14 @@ def main(cfg: DictConfig) -> None:
             )
         else:
             model_state_dict = model_to_train.state_dict()
-            projection_v_state = projection_v.state_dict()
-            projection_t_state = projection_t.state_dict()
-            logit_scale_data = logit_scale.data
+            # logit_scale is now a fixed tensor, not a Parameter
+            logit_scale_data = logit_scale.item() if logit_scale.numel() == 1 else logit_scale
 
         checkpoint_dict = {
             "student_model": model_state_dict,
-            "projection_v": projection_v_state,
-            "projection_t": projection_t_state,
             "logit_scale": logit_scale_data,
             "config": OmegaConf.to_container(cfg, resolve=True),
+            "model_config": student_config.to_dict(),  # Save model architecture config
         }
         if early_stopping_enabled:
             checkpoint_dict["best_step"] = best_step
@@ -1196,26 +1083,27 @@ def main(cfg: DictConfig) -> None:
         OmegaConf.save(cfg, config_save_path)
         print(f"Configuration saved to {config_save_path}")
 
+        # Save model architecture config as JSON
+        model_config_path = output_dir / "model_config.json"
+        student_config.save_json(model_config_path)
+        print(f"Model architecture config saved to {model_config_path}")
+
         # Save student processor for inference (Hugging Face style)
         print("\n=== Saving Student Processor for Inference ===")
 
-        if student_processor is not None:
-            # Reset augmentation to False for inference
-            if hasattr(student_processor.image_processor, "use_augmentation"):
-                student_processor.image_processor.use_augmentation = False
-                student_processor.image_processor._build_transform()
+        # Reset augmentation to False for inference
+        if hasattr(processor.image_processor, "use_augmentation"):
+            processor.image_processor.use_augmentation = False
+            processor.image_processor._build_transform()
 
-            processor_save_path = output_dir / "processor"
-            try:
-                student_processor.save_pretrained(str(processor_save_path))
-                print(f"✓ Student processor saved to {processor_save_path}")
-                print(f"  - Tokenizer: {processor_save_path / 'tokenizer'}")
-                print(f"  - Image processor: {processor_save_path / 'image_processor'}")
-            except Exception as e:
-                print(f"Warning: Could not save student processor: {e}")
-        else:
-            print("Warning: Student processor is None, skipping processor save.")
-            print("  Note: Inference will require manual tokenizer and image processor setup.")
+        processor_save_path = output_dir / "processor"
+        try:
+            processor.save_pretrained(str(processor_save_path))
+            print(f"✓ Processor saved to {processor_save_path}")
+            print(f"  - Tokenizer: {processor_save_path / 'tokenizer'}")
+            print(f"  - Image processor: {processor_save_path / 'image_processor'}")
+        except Exception as e:
+            print(f"Warning: Could not save processor: {e}")
 
         print("=" * 50)
 
