@@ -7,6 +7,7 @@ batch-internal evaluation during training, which only searches within a small ba
 """
 
 import argparse
+import os
 import re
 import time
 from pathlib import Path
@@ -19,6 +20,8 @@ from transformers import AutoProcessor
 
 from tinysiglip.coco_dataset import COCOCaptionDataset, collate_coco_batch
 from tinysiglip.model import TinySiglipConfig, TinySiglipModel
+
+os.environ["TOKENIZERS_PARALLELIZATION"] = "false"
 
 try:
     import wandb
@@ -756,47 +759,71 @@ def main():
         print("=" * 60 + "\n")
         print("Evaluation completed successfully!")
 
-        # Log to WandB table
+        # Log to WandB tables
         if wandb_enabled:
-            # Prepare table data
-            table_data = []
-            row = {
-                "checkpoint": Path(args.resume).name,
-                "split": args.split,
-                "total_params_M": total_params / 1e6,
-                "trainable_params_M": trainable_params / 1e6,
-                "throughput_samples_per_sec": perf_metrics["throughput_samples_per_sec"],
-                "latency_avg_ms": perf_metrics["latency_avg_ms"],
-                "latency_p50_ms": perf_metrics["latency_p50_ms"],
-                "latency_p95_ms": perf_metrics["latency_p95_ms"],
-                "latency_p99_ms": perf_metrics["latency_p99_ms"],
-            }
+            # 1. Create vertical summary table (transposed format)
+            summary_table_data = [
+                ["Checkpoint", Path(args.resume).name],
+                ["Split", args.split],
+                ["Total Params (M)", f"{total_params / 1e6:.2f}"],
+                ["Trainable Params (M)", f"{trainable_params / 1e6:.2f}"],
+                ["Throughput (samples/sec)", f"{perf_metrics['throughput_samples_per_sec']:.2f}"],
+                ["Latency Avg (ms)", f"{perf_metrics['latency_avg_ms']:.2f}"],
+                ["Latency P50 (ms)", f"{perf_metrics['latency_p50_ms']:.2f}"],
+                ["Latency P95 (ms)", f"{perf_metrics['latency_p95_ms']:.2f}"],
+                ["Latency P99 (ms)", f"{perf_metrics['latency_p99_ms']:.2f}"],
+            ]
+            summary_table = wandb.Table(columns=["Metric", "Value"], data=summary_table_data)
+            wandb.log({"summary_table": summary_table})
 
-            # Add student retrieval metrics
+            # 2. Create teacher vs student retrieval recall comparison table
+            has_teacher = any(key.startswith("teacher_") for key in results.keys())
+            recall_comparison_data = []
+
+            # Image-to-Text Retrieval section
+            recall_comparison_data.append(["Image-to-Text Retrieval", "", "", ""])
             for k in [1, 5, 10]:
                 i2t_key = f"i2t_recall@{k}"
+                student_val = results.get(i2t_key, None)
+                teacher_val = results.get(f"teacher_{i2t_key}", None) if has_teacher else None
+
+                student_str = f"{student_val:.2f}%" if student_val is not None else "N/A"
+                teacher_str = f"{teacher_val:.2f}%" if teacher_val is not None else "N/A"
+
+                # Calculate gap if both available
+                if student_val is not None and teacher_val is not None:
+                    gap = student_val - teacher_val
+                    gap_str = f"{gap:+.2f}%"
+                else:
+                    gap_str = "N/A"
+
+                recall_comparison_data.append([f"Recall@{k}", student_str, teacher_str, gap_str])
+
+            # Text-to-Image Retrieval section
+            recall_comparison_data.append(["Text-to-Image Retrieval", "", "", ""])
+            for k in [1, 5, 10]:
                 t2i_key = f"t2i_recall@{k}"
-                if i2t_key in results:
-                    row[f"student_i2t_recall@{k}"] = results[i2t_key]
-                if t2i_key in results:
-                    row[f"student_t2i_recall@{k}"] = results[t2i_key]
+                student_val = results.get(t2i_key, None)
+                teacher_val = results.get(f"teacher_{t2i_key}", None) if has_teacher else None
 
-            # Add teacher retrieval metrics if available
-            has_teacher = any(key.startswith("teacher_") for key in results.keys())
-            if has_teacher:
-                for k in [1, 5, 10]:
-                    teacher_i2t_key = f"teacher_i2t_recall@{k}"
-                    teacher_t2i_key = f"teacher_t2i_recall@{k}"
-                    if teacher_i2t_key in results:
-                        row[f"teacher_i2t_recall@{k}"] = results[teacher_i2t_key]
-                    if teacher_t2i_key in results:
-                        row[f"teacher_t2i_recall@{k}"] = results[teacher_t2i_key]
+                student_str = f"{student_val:.2f}%" if student_val is not None else "N/A"
+                teacher_str = f"{teacher_val:.2f}%" if teacher_val is not None else "N/A"
 
-            table_data.append(row)
+                # Calculate gap if both available
+                if student_val is not None and teacher_val is not None:
+                    gap = student_val - teacher_val
+                    gap_str = f"{gap:+.2f}%"
+                else:
+                    gap_str = "N/A"
 
-            # Create and log table
-            table = wandb.Table(columns=list(table_data[0].keys()), data=[list(row.values()) for row in table_data])
-            wandb.log({"evaluation_results": table})
+                recall_comparison_data.append([f"Recall@{k}", student_str, teacher_str, gap_str])
+
+            # Create comparison table
+            recall_comparison_table = wandb.Table(
+                columns=["Metric", "Student", "Teacher", "Gap (Student - Teacher)"],
+                data=recall_comparison_data,
+            )
+            wandb.log({"retrieval_recall_comparison": recall_comparison_table})
 
             # Also log as summary metrics for easy comparison
             wandb.summary.update(
