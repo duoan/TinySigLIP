@@ -1,9 +1,21 @@
 #!/bin/bash
 # End-to-end evaluation script for TinySigLIP on COCO val
-# 1) Prepare COCO val data + teacher embeddings
+# 1) Prepare COCO val data + teacher embeddings (skip if cache exists)
 # 2) List local checkpoints and let user choose (with option to pick the most recent)
+#
+# Usage:
+#   ./eval.sh                    # Normal evaluation (skip data prep if cache exists)
+#   ./eval.sh --force-prepare     # Force re-preparation of data and embeddings
 
 set -e
+
+# Parse command line arguments
+FORCE_PREPARE=0
+if [ "$1" = "--force-prepare" ] || [ "$1" = "-f" ]; then
+    FORCE_PREPARE=1
+    echo ">>> Force prepare mode: will regenerate data and embeddings even if cache exists"
+    echo
+fi
 
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,23 +37,63 @@ echo "==============================================="
 echo
 
 ########################################
-# Step 1: Prepare COCO val data + embeddings
+# Step 1: Prepare COCO val data + embeddings (skip if already exists)
 ########################################
 
-echo ">>> Step 1: Preparing COCO '${SPLIT}' data and teacher embeddings"
+echo ">>> Step 1: Checking if COCO '${SPLIT}' data and teacher embeddings exist"
 echo
 
 # Ensure base directories exist
 mkdir -p "${DATA_DIR}"
 mkdir -p "${CACHE_DIR}"
 
-python3 "${SCRIPT_DIR}/prepare_data.py" \
-    --split "${SPLIT}" \
-    --teacher-model "${TEACHER_MODEL}" \
-    --cache-dir "${CACHE_DIR}"
+# Sanitize teacher model name for filesystem (same logic as prepare_data.py)
+SAFE_MODEL_NAME=$(echo "${TEACHER_MODEL}" | sed 's/[^a-zA-Z0-9_-]/_/g' | sed 's/^_\|_$//g')
 
-echo
-echo ">>> Data & embeddings preparation done."
+# Check for cache in different dataset sizes (tiny, medium, large)
+# Try large first (default), then medium, then tiny
+CACHE_FOUND=0
+for DATASET_SIZE in "large" "medium" "tiny"; do
+    CACHE_PATH="${CACHE_DIR}/${SAFE_MODEL_NAME}/${DATASET_SIZE}/${SPLIT}"
+    METADATA_FILE="${CACHE_PATH}/metadata.json"
+
+    if [ -f "${METADATA_FILE}" ]; then
+        echo "✓ Found existing cache at: ${CACHE_PATH}"
+        echo "  Metadata file: ${METADATA_FILE}"
+
+        # Check if there are batch files (indicating embeddings are complete)
+        BATCH_COUNT=$(find "${CACHE_PATH}" -maxdepth 1 -name "batch_*.pkl" 2>/dev/null | wc -l | tr -d ' ')
+        if [ "${BATCH_COUNT}" -gt 0 ]; then
+            echo "  Found ${BATCH_COUNT} batch file(s) - embeddings appear complete"
+            CACHE_FOUND=1
+            break
+        else
+            echo "  ⚠ Warning: Metadata exists but no batch files found"
+        fi
+    fi
+done
+
+if [ "${CACHE_FOUND}" -eq 0 ] || [ "${FORCE_PREPARE}" -eq 1 ]; then
+    if [ "${FORCE_PREPARE}" -eq 1 ]; then
+        echo "⚠ Force prepare mode: Regenerating COCO '${SPLIT}' data and teacher embeddings..."
+    else
+        echo "⚠ Cache not found. Preparing COCO '${SPLIT}' data and teacher embeddings..."
+    fi
+    echo "  This may take a while, especially for embedding extraction."
+    echo
+
+    python3 "${SCRIPT_DIR}/prepare_data.py" \
+        --split "${SPLIT}" \
+        --teacher-model "${TEACHER_MODEL}" \
+        --cache-dir "${CACHE_DIR}"
+
+    echo
+    echo ">>> Data & embeddings preparation done."
+else
+    echo
+    echo ">>> Skipping data preparation (cache already exists)"
+    echo "   Use --force-prepare to regenerate data and embeddings"
+fi
 echo
 
 ########################################

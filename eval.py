@@ -21,7 +21,7 @@ from transformers import AutoProcessor
 from tinysiglip.coco_dataset import COCOCaptionDataset, collate_coco_batch
 from tinysiglip.model import TinySiglipConfig, TinySiglipModel
 
-os.environ["TOKENIZERS_PARALLELIZATION"] = "false"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 try:
     import wandb
