@@ -8,6 +8,7 @@ batch-internal evaluation during training, which only searches within a small ba
 
 import argparse
 import re
+import time
 from pathlib import Path
 
 import torch
@@ -18,6 +19,14 @@ from transformers import AutoProcessor
 
 from tinysiglip.coco_dataset import COCOCaptionDataset, collate_coco_batch
 from tinysiglip.model import TinySiglipConfig, TinySiglipModel
+
+try:
+    import wandb
+
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not installed. Install with: pip install wandb")
 
 
 def load_checkpoint(checkpoint_path: str, device: str = "cuda"):
@@ -89,6 +98,89 @@ def create_processor_from_config(config, device: str = "cuda"):
     except Exception as e:
         print(f"Warning: Could not load processor from {model_name}: {e}")
         return None
+
+
+def count_parameters(model: torch.nn.Module) -> int:
+    """Count the number of parameters in a model."""
+    return sum(p.numel() for p in model.parameters())
+
+
+def measure_throughput_latency(
+    model: TinySiglipModel,
+    processor,  # AutoProcessor instance
+    device: str = "cuda",
+    num_warmup: int = 10,
+    num_runs: int = 100,
+    batch_size: int = 1,
+):
+    """
+    Measure model throughput and latency.
+
+    Args:
+        model: TinySiglipModel instance
+        processor: AutoProcessor instance
+        device: Device to run on
+        num_warmup: Number of warmup runs
+        num_runs: Number of measurement runs
+        batch_size: Batch size for measurement
+
+    Returns:
+        dict: Dictionary with throughput and latency metrics
+    """
+    model.eval()
+    device_obj = torch.device(device)
+
+    # Create dummy inputs
+    dummy_images = torch.randn(batch_size, 3, 224, 224).to(device_obj)
+    dummy_text = "a photo of a cat"
+    # Process text - match the format used in evaluation
+    text_inputs = processor(text=[dummy_text] * batch_size, return_tensors="pt", padding=True)
+    dummy_text_ids = text_inputs["input_ids"].to(device_obj)
+    # Note: evaluation code doesn't pass attention_mask, so we don't either
+
+    # Warmup
+    with torch.no_grad():
+        for _ in range(num_warmup):
+            _ = model(dummy_images, dummy_text_ids)
+
+    # Synchronize if using CUDA
+    if device_obj.type == "cuda":
+        torch.cuda.synchronize()
+
+    # Measure latency
+    latencies = []
+    with torch.no_grad():
+        for _ in range(num_runs):
+            if device_obj.type == "cuda":
+                torch.cuda.synchronize()
+            start_time = time.time()
+            _ = model(dummy_images, dummy_text_ids)
+            if device_obj.type == "cuda":
+                torch.cuda.synchronize()
+            end_time = time.time()
+            latencies.append((end_time - start_time) * 1000)  # Convert to ms
+
+    # Calculate metrics
+    avg_latency_ms = sum(latencies) / len(latencies)
+    min_latency_ms = min(latencies)
+    max_latency_ms = max(latencies)
+    p50_latency_ms = sorted(latencies)[len(latencies) // 2]
+    p95_latency_ms = sorted(latencies)[int(len(latencies) * 0.95)]
+    p99_latency_ms = sorted(latencies)[int(len(latencies) * 0.99)]
+
+    # Throughput: samples per second
+    throughput_samples_per_sec = (batch_size * 1000) / avg_latency_ms if avg_latency_ms > 0 else 0
+
+    return {
+        "latency_avg_ms": avg_latency_ms,
+        "latency_min_ms": min_latency_ms,
+        "latency_max_ms": max_latency_ms,
+        "latency_p50_ms": p50_latency_ms,
+        "latency_p95_ms": p95_latency_ms,
+        "latency_p99_ms": p99_latency_ms,
+        "throughput_samples_per_sec": throughput_samples_per_sec,
+        "batch_size": batch_size,
+    }
 
 
 def evaluate_retrieval_coco(
@@ -479,6 +571,23 @@ def main():
         action="store_true",
         help="Skip evaluation of teacher (cached) embeddings and only evaluate the student model",
     )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default="tinysiglip-eval",
+        help="WandB project name (default: tinysiglip-eval)",
+    )
+    parser.add_argument(
+        "--wandb-name",
+        type=str,
+        default=None,
+        help="WandB run name (default: auto-generated from checkpoint path)",
+    )
+    parser.add_argument(
+        "--skip-wandb",
+        action="store_true",
+        help="Skip WandB logging",
+    )
 
     args = parser.parse_args()
 
@@ -523,6 +632,51 @@ def main():
 
     if processor is None:
         raise ValueError("Could not load or create processor. Please check checkpoint and config.")
+
+    # Initialize WandB
+    wandb_enabled = WANDB_AVAILABLE and not args.skip_wandb
+    if wandb_enabled:
+        checkpoint_name = Path(args.resume).stem
+        run_name = args.wandb_name or f"eval_{checkpoint_name}"
+        wandb.init(
+            project=args.wandb_project,
+            name=run_name,
+            config={
+                "checkpoint": args.resume,
+                "split": args.split,
+                "batch_size": args.batch_size,
+                "num_workers": args.num_workers,
+                "device": args.device,
+                "logit_scale": logit_scale,
+                "max_samples": args.max_samples,
+                "evaluate_teacher": not args.skip_teacher,
+            },
+        )
+        print(f"✓ WandB initialized: {wandb.run.url if wandb.run else 'N/A'}")
+
+    # Calculate model parameters
+    total_params = count_parameters(model)
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print("\n=== Model Parameters ===")
+    print(f"Total parameters: {total_params:,} ({total_params / 1e6:.2f}M)")
+    print(f"Trainable parameters: {trainable_params:,} ({trainable_params / 1e6:.2f}M)")
+    print("=" * 30)
+
+    # Measure throughput and latency
+    print("\n=== Measuring Throughput and Latency ===")
+    perf_metrics = measure_throughput_latency(
+        model=model,
+        processor=processor,
+        device=args.device,
+        num_warmup=10,
+        num_runs=100,
+        batch_size=1,
+    )
+    print(f"Average latency: {perf_metrics['latency_avg_ms']:.2f} ms")
+    print(f"P50 latency: {perf_metrics['latency_p50_ms']:.2f} ms")
+    print(f"P95 latency: {perf_metrics['latency_p95_ms']:.2f} ms")
+    print(f"Throughput: {perf_metrics['throughput_samples_per_sec']:.2f} samples/sec")
+    print("=" * 30)
 
     # Determine dataset path
     dataset_path = args.dataset_path
@@ -597,10 +751,130 @@ def main():
         for k in [1, 5, 10]:
             key = f"t2i_recall@{k}"
             if key in results:
-                print(f"  Recall@{k}: {results[key]:{'.2f'}%}")
+                print(f"  Recall@{k}: {results[key]:.2f}%")
 
         print("=" * 60 + "\n")
         print("Evaluation completed successfully!")
+
+        # Log to WandB table
+        if wandb_enabled:
+            # Prepare table data
+            table_data = []
+            row = {
+                "checkpoint": Path(args.resume).name,
+                "split": args.split,
+                "total_params_M": total_params / 1e6,
+                "trainable_params_M": trainable_params / 1e6,
+                "throughput_samples_per_sec": perf_metrics["throughput_samples_per_sec"],
+                "latency_avg_ms": perf_metrics["latency_avg_ms"],
+                "latency_p50_ms": perf_metrics["latency_p50_ms"],
+                "latency_p95_ms": perf_metrics["latency_p95_ms"],
+                "latency_p99_ms": perf_metrics["latency_p99_ms"],
+            }
+
+            # Add student retrieval metrics
+            for k in [1, 5, 10]:
+                i2t_key = f"i2t_recall@{k}"
+                t2i_key = f"t2i_recall@{k}"
+                if i2t_key in results:
+                    row[f"student_i2t_recall@{k}"] = results[i2t_key]
+                if t2i_key in results:
+                    row[f"student_t2i_recall@{k}"] = results[t2i_key]
+
+            # Add teacher retrieval metrics if available
+            has_teacher = any(key.startswith("teacher_") for key in results.keys())
+            if has_teacher:
+                for k in [1, 5, 10]:
+                    teacher_i2t_key = f"teacher_i2t_recall@{k}"
+                    teacher_t2i_key = f"teacher_t2i_recall@{k}"
+                    if teacher_i2t_key in results:
+                        row[f"teacher_i2t_recall@{k}"] = results[teacher_i2t_key]
+                    if teacher_t2i_key in results:
+                        row[f"teacher_t2i_recall@{k}"] = results[teacher_t2i_key]
+
+            table_data.append(row)
+
+            # Create and log table
+            table = wandb.Table(columns=list(table_data[0].keys()), data=[list(row.values()) for row in table_data])
+            wandb.log({"evaluation_results": table})
+
+            # Also log as summary metrics for easy comparison
+            wandb.summary.update(
+                {
+                    "model/total_params": total_params,
+                    "model/total_params_M": total_params / 1e6,
+                    "model/trainable_params": trainable_params,
+                    "model/trainable_params_M": trainable_params / 1e6,
+                    "performance/throughput_samples_per_sec": perf_metrics["throughput_samples_per_sec"],
+                    "performance/latency_avg_ms": perf_metrics["latency_avg_ms"],
+                    "performance/latency_p50_ms": perf_metrics["latency_p50_ms"],
+                    "performance/latency_p95_ms": perf_metrics["latency_p95_ms"],
+                    "performance/latency_p99_ms": perf_metrics["latency_p99_ms"],
+                }
+            )
+
+            # Add retrieval metrics to summary
+            for key, value in results.items():
+                wandb.summary[f"retrieval/{key}"] = value
+
+            # Upload checkpoint to WandB as artifact
+            checkpoint_path = Path(args.resume)
+            if checkpoint_path.exists():
+                print("\n=== Uploading checkpoint to WandB ===")
+                try:
+                    # Create artifact with descriptive name
+                    checkpoint_name = checkpoint_path.stem
+                    artifact_name = f"tinysiglip-checkpoint-{checkpoint_name}"
+                    artifact = wandb.Artifact(
+                        artifact_name,
+                        type="model",
+                        description=f"TinySigLIP model checkpoint: {checkpoint_name}",
+                        metadata={
+                            "checkpoint_path": str(checkpoint_path),
+                            "total_params_M": total_params / 1e6,
+                            "trainable_params_M": trainable_params / 1e6,
+                            "split": args.split,
+                            "logit_scale": logit_scale,
+                        },
+                    )
+
+                    # Add checkpoint file
+                    artifact.add_file(str(checkpoint_path), name=checkpoint_path.name)
+                    print(f"  Added checkpoint file: {checkpoint_path.name}")
+
+                    # Also add processor directory if it exists
+                    checkpoint_dir = checkpoint_path.parent
+                    processor_dir = checkpoint_dir / "processor"
+                    if processor_dir.exists() and processor_dir.is_dir():
+                        artifact.add_dir(str(processor_dir), name="processor")
+                        print("  Added processor directory: processor/")
+
+                    # Add model config if it exists
+                    model_config_file = checkpoint_dir / "model_config.json"
+                    if model_config_file.exists():
+                        artifact.add_file(str(model_config_file), name="model_config.json")
+                        print("  Added model config: model_config.json")
+
+                    # Add training config if it exists
+                    config_file = checkpoint_dir / "config.yaml"
+                    if config_file.exists():
+                        artifact.add_file(str(config_file), name="config.yaml")
+                        print("  Added training config: config.yaml")
+
+                    # Log artifact
+                    wandb.log_artifact(artifact)
+                    print(f"✓ Checkpoint uploaded to WandB as artifact: {artifact_name}")
+                except Exception as e:
+                    print(f"⚠ Warning: Failed to upload checkpoint to WandB: {e}")
+
+            print("\n✓ Results logged to WandB")
+            if wandb.run:
+                run_url = wandb.run.url if hasattr(wandb.run, "url") else None
+                wandb.finish()
+                if run_url:
+                    print(f"✓ WandB run completed: {run_url}")
+                else:
+                    print("✓ WandB run completed")
 
 
 if __name__ == "__main__":

@@ -799,7 +799,7 @@ Examples:
         help=(
             "Number of images to store in each cached teacher batch file. "
             "Larger values create fewer, larger .pt files (less frequent disk I/O during training) "
-            "but require more RAM per loaded batch."
+            "but require more RAM and time per loaded batch."
         ),
     )
     parser.add_argument(
